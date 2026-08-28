@@ -33,12 +33,13 @@ A package looks like:
 lectures/<date>-<slug>/
 ├── README.md
 ├── transcript.md
-└── frames/            # optional: HH-MM-SS.jpg + index.csv
+├── frames/            # optional: HH-MM-SS.jpg + index.csv
+└── materials/         # optional: slides.pdf + slides.md + pages/ + slide-links.md
 ```
 
 The package is read-only source. Nothing is written back into it — the vault is the sink.
 
-Read `README.md` and `transcript.md` before writing. When frames exist and the professor says "isso aqui", "essa linha", "como vocês podem ver", open the nearest preceding frame. Transcript is the verbal source; frames recover what they were pointing at. A transcript-only package is valid when the class had no screen recording.
+Read `README.md` and `transcript.md` before writing. When frames exist and the professor says "isso aqui", "essa linha", "como vocês podem ver", open the nearest preceding frame. When `materials/` exists, use `slide-links.md` only as a page candidate list and verify the page in `slides.pdf`; a lexical candidate is not proof of what was shown at that second. Transcript is the verbal source; frames and slides recover visual context. A transcript-only package is valid when the class had no screen recording; build it with `prepare_transcript.py`.
 
 ## Then write (or open) the note — before answering
 

@@ -142,8 +142,8 @@ def normalize_transcript(content: str) -> List[Dict[str, Any]]:
         current = entry["sec"]
         if previous is not None and current < previous:
             raise ValueError(
-                "Wispr transcript timeline goes backwards. Rebase paused/resumed "
-                "segments onto one continuous timeline before compiling."
+                "Wispr transcript timestamps go backwards. Export one session or "
+                "correct the combined source timeline before compiling."
             )
         previous = current
 

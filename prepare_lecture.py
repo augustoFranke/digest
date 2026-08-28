@@ -8,6 +8,7 @@ Compiles raw lecture video recording(s) and transcript into an agent-ready lectu
     <lecture_dir>/
     ├── README.md
     ├── transcript.md
+    ├── materials/  (optional slide PDF and page index)
     └── frames/
         ├── index.csv
         ├── 00-04-37.jpg
@@ -32,6 +33,7 @@ norm_mod = SourceFileLoader("01_norm", str(curr_dir / "01_normalize_transcript.p
 extract_mod = SourceFileLoader("02_ext", str(curr_dir / "02_extract_frames.py")).load_module()
 crop_mod = SourceFileLoader("03_crop", str(curr_dir / "03_crop_frames.py")).load_module()
 dedupe_mod = SourceFileLoader("04_dedupe", str(curr_dir / "04_dedupe_and_rename.py")).load_module()
+slide_mod = SourceFileLoader("slide_materials", str(curr_dir / "slide_materials.py")).load_module()
 
 RECORDING_SUFFIX = ".mov"
 TRANSCRIPT_SUFFIX = ".txt"
@@ -91,11 +93,30 @@ def describe_crop(crop_boxes: dict) -> str:
     )
 
 
+def _describe_materials(has_slides: bool) -> tuple[str, str]:
+    """Returns README fragments for an optional ingested slide deck."""
+    if not has_slides:
+        return "", ""
+    source = (
+        "- `materials/slides.pdf`, `materials/slides.md` and `materials/pages/`: professor's "
+        "slide deck, indexed by page.\n"
+        "- `materials/slide-links.md`: lexical page candidates for transcript sections; review "
+        "before treating them as evidence.\n"
+    )
+    instructions = (
+        "\nWhen `materials/slide-links.md` contains a candidate, open the corresponding page in "
+        "`materials/slides.pdf` and confirm the claim against the page's visual layout. A "
+        "candidate is not proof that the page was shown at that exact second.\n"
+    )
+    return source, instructions
+
+
 def generate_readme(
     lecture_title: str,
     offsets_str: List[str],
     offsets_seconds: List[int],
-    crop_boxes: dict
+    crop_boxes: dict,
+    has_slides: bool = False,
 ) -> str:
     """
     Generates standard agent-optimized README.md.
@@ -117,6 +138,8 @@ def generate_readme(
     alignment_block = "\n".join(alignment_lines)
     crop_block = describe_crop(crop_boxes)
 
+    material_source, material_instructions = _describe_materials(has_slides)
+
     readme_content = f"""# Lecture Context: {lecture_title}
 
 This directory contains structured context and materials from one lecture, compiled for AI agent consumption and study note generation.
@@ -126,6 +149,7 @@ This directory contains structured context and materials from one lecture, compi
 - `transcript.md`: Wispr transcript normalized onto the lecture timeline.
 - `frames/`: Keyframe screenshots extracted from the professor's shared screen.
 - `frames/index.csv`: Fast lookup index of available frame timestamps.
+{material_source}
 
 ## Frame Naming Convention
 
@@ -155,6 +179,7 @@ When interpreting statements in `transcript.md` such as:
 2. Inspect `frames/index.csv` or list `frames/` to find the closest matching or preceding frame.
 3. Open and view the image in `frames/HH-MM-SS.jpg` to recover full visual context.
 4. Use `transcript.md` as the primary verbal source and `frames/` as visual context.
+{material_instructions}
 
 ## Where the output goes
 
@@ -169,6 +194,58 @@ The full protocol — filename, frontmatter, how to fold a question into the not
 promotion rules — is in `AGENTS.md` at the repo root. Read it before digesting.
 """
     return readme_content.strip() + "\n"
+
+
+def _compile_slide_links(output_dir, entries) -> bool:
+    """Generates slide candidates when a PDF was ingested before the transcript."""
+    slides_pdf = output_dir / "materials" / "slides.pdf"
+    if not slides_pdf.is_file():
+        return False
+    print("\n[Step 5/6] Associating transcript sections with slide-page candidates...")
+    link_count = slide_mod.write_slide_links(output_dir, entries)
+    print(f"✓ Wrote {link_count} slide candidate section(s)")
+    return True
+
+
+def _write_package_readme(
+    output_dir: Path,
+    lecture_title: str,
+    offsets_str_list: List[str],
+    offsets_seconds: List[int],
+    crop_boxes: dict,
+    has_slides: bool,
+) -> None:
+    """Writes the final package README and reports its generated contents."""
+    step_label = "6/6" if has_slides else "5/5"
+    print(f"\n[Step {step_label}] Generating README.md...")
+    readme_content = generate_readme(
+        lecture_title=lecture_title,
+        offsets_str=offsets_str_list,
+        offsets_seconds=offsets_seconds,
+        crop_boxes=crop_boxes,
+        has_slides=has_slides,
+    )
+    readme_path = output_dir / "README.md"
+    readme_path.write_text(readme_content, encoding="utf-8")
+    print(f"✓ Created agent README at {readme_path}")
+
+
+def _step_number(step: int, has_slides: bool) -> str:
+    """Formats progress consistently for the five- or six-step pipeline."""
+    return f"{step}/{6 if has_slides else 5}"
+
+
+def _report_completion(output_dir: Path, saved_count: int, has_slides: bool) -> None:
+    """Reports the generated package contents."""
+    print("\n" + "=" * 60)
+    print("✨ Lecture Context successfully prepared!")
+    print(f"📁 Directory: {output_dir}")
+    print("   ├── README.md")
+    print("   ├── transcript.md")
+    print(f"   ├── frames/ ({saved_count} deduplicated frames + index.csv)")
+    if has_slides:
+        print("   └── materials/ (slides.pdf, slides.md, slides-index.csv, slide-links.md)")
+    print("=" * 60)
 
 
 def prepare_lecture(
@@ -204,6 +281,7 @@ def prepare_lecture(
 
     offsets_seconds = [dedupe_mod.parse_offset_string(o) for o in offsets_str_list]
     lecture_title = title or output_dir.name
+    has_ingested_slides = (output_dir / "materials" / "slides.pdf").is_file()
 
     try:
         transcript_content = transcript_path.read_text(encoding="utf-8")
@@ -227,13 +305,13 @@ def prepare_lecture(
     print("=" * 60)
 
     # Step 1: Normalize Transcript
-    print("\n[Step 1/5] Normalizing transcript...")
+    print(f"\n[Step {_step_number(1, has_ingested_slides)}] Normalizing transcript...")
     transcript_out_path = output_dir / "transcript.md"
     transcript_out_path.write_text(transcript_md, encoding="utf-8")
     print(f"✓ Saved {len(entries)} transcript sections to {transcript_out_path}")
 
     # Step 2: Extract Frames
-    print("\n[Step 2/5] Extracting video frames...")
+    print(f"\n[Step {_step_number(2, has_ingested_slides)}] Extracting video frames...")
     raw_frames_dir.mkdir(parents=True, exist_ok=True)
     total_raw = extract_mod.extract_frames(
         video_paths=video_paths,
@@ -244,7 +322,7 @@ def prepare_lecture(
     )
 
     # Step 3: Crop away the call's interface and shrink what is left
-    print("\n[Step 3/5] Cropping frames to the shared screen and resizing...")
+    print(f"\n[Step {_step_number(3, has_ingested_slides)}] Cropping frames to the shared screen and resizing...")
     crop_boxes = crop_mod.crop_frames(
         raw_dir=raw_frames_dir,
         output_dir=cropped_frames_dir,
@@ -258,7 +336,7 @@ def prepare_lecture(
         print(f"  Removed full-resolution frames: {raw_frames_dir}")
 
     # Step 4: Deduplicate and Rename Frames
-    print("\n[Step 4/5] Deduplicating and renaming frames by transcript timestamp...")
+    print(f"\n[Step {_step_number(4, has_ingested_slides)}] Deduplicating and renaming frames by transcript timestamp...")
     saved_records = dedupe_mod.dedupe_and_rename_frames(
         raw_dir=cropped_frames_dir,
         output_dir=frames_dir,
@@ -269,25 +347,12 @@ def prepare_lecture(
         clean_raw=not keep_raw
     )
 
-    # Step 5: Generate README.md
-    print("\n[Step 5/5] Generating README.md...")
-    readme_content = generate_readme(
-        lecture_title=lecture_title,
-        offsets_str=offsets_str_list,
-        offsets_seconds=offsets_seconds,
-        crop_boxes=crop_boxes
+    has_slides = _compile_slide_links(output_dir, entries)
+    _write_package_readme(
+        output_dir, lecture_title, offsets_str_list, offsets_seconds, crop_boxes, has_slides
     )
-    readme_path = output_dir / "README.md"
-    readme_path.write_text(readme_content, encoding="utf-8")
-    print(f"✓ Created agent README at {readme_path}")
 
-    print("\n" + "=" * 60)
-    print("✨ Lecture Context successfully prepared!")
-    print(f"📁 Directory: {output_dir}")
-    print(f"   ├── README.md")
-    print(f"   ├── transcript.md")
-    print(f"   └── frames/ ({len(saved_records)} deduplicated frames + index.csv)")
-    print("=" * 60)
+    _report_completion(output_dir, len(saved_records), has_slides)
 
 
 def main():

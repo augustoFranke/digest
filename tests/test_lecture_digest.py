@@ -9,6 +9,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from importlib.machinery import SourceFileLoader
+from unittest.mock import patch
 
 import numpy as np
 from PIL import Image
@@ -20,6 +21,110 @@ extract_mod = SourceFileLoader("extract_mod", str(root_dir / "02_extract_frames.
 crop_mod = SourceFileLoader("crop_mod", str(root_dir / "03_crop_frames.py")).load_module()
 dedupe_mod = SourceFileLoader("dedupe_mod", str(root_dir / "04_dedupe_and_rename.py")).load_module()
 prepare_mod = SourceFileLoader("prepare_mod", str(root_dir / "prepare_lecture.py")).load_module()
+slides_mod = SourceFileLoader("slides_mod", str(root_dir / "slide_materials.py")).load_module()
+transcript_prepare_mod = SourceFileLoader("transcript_prepare_mod", str(root_dir / "prepare_transcript.py")).load_module()
+
+
+class TestSlideMaterials(unittest.TestCase):
+    def setUp(self):
+        self.temp_dir = Path(tempfile.mkdtemp(prefix="lecture_digest_slides_"))
+        self.source_pdf = self.temp_dir / "professor-slides.pdf"
+        self.source_pdf.write_bytes(b"placeholder PDF used by the ingestion contract test")
+
+    def tearDown(self):
+        shutil.rmtree(self.temp_dir, ignore_errors=True)
+
+    def test_ingests_pdf_without_transcript(self):
+        pages = [
+            slides_mod.SlidePage(1, "Gerência de configuração e baseline"),
+            slides_mod.SlidePage(2, "Imagem sem camada de texto"),
+        ]
+
+        with patch.object(slides_mod, "extract_slide_pages", return_value=pages), patch.object(
+            slides_mod, "render_slide_pages", return_value=[]
+        ):
+            count = slides_mod.ingest_slides(self.source_pdf, self.temp_dir / "lecture")
+
+        materials = self.temp_dir / "lecture" / "materials"
+        self.assertEqual(count, 2)
+        self.assertTrue((materials / "slides.pdf").is_file())
+        self.assertIn("## Página 1", (materials / "slides.md").read_text(encoding="utf-8"))
+        self.assertIn("2,", (materials / "slides-index.csv").read_text(encoding="utf-8"))
+        self.assertIn("slides.pdf", (materials / "README.md").read_text(encoding="utf-8"))
+        self.assertIn("prepare_transcript.py", (self.temp_dir / "lecture" / "README.md").read_text(encoding="utf-8"))
+
+    def test_links_transcript_sections_to_page_candidates(self):
+        pages = [
+            slides_mod.SlidePage(1, "Gerência de configuração baseline item de configuração"),
+            slides_mod.SlidePage(2, "Integração contínua pipeline deploy"),
+        ]
+        entries = [{"type": "timestamp", "sec": 42, "text": "A baseline identifica o item de configuração."}]
+
+        links = slides_mod.link_transcript_to_slides(entries, pages)
+        rendered = slides_mod.render_slide_links(links)
+
+        self.assertEqual(links[0]["timestamp"], 42)
+        self.assertEqual(links[0]["candidates"][0]["page"], 1)
+        self.assertIn("confiança", rendered)
+        self.assertIn("não prova", rendered)
+
+    def test_rejects_non_pdf_slide_material(self):
+        text_file = self.temp_dir / "slides.pptx"
+        text_file.touch()
+
+        with self.assertRaisesRegex(ValueError, r"\.pdf"):
+            slides_mod.ingest_slides(text_file, self.temp_dir / "lecture")
+
+    def test_compiled_readme_mentions_ingested_slides(self):
+        readme = prepare_mod.generate_readme(
+            lecture_title="Aula com slides",
+            offsets_str=["00:00:00"],
+            offsets_seconds=[0],
+            crop_boxes={},
+            has_slides=True,
+        )
+
+        self.assertIn("materials/slides.pdf", readme)
+        self.assertIn("slide-links.md", readme)
+        self.assertIn("not proof", readme)
+
+
+class TestTranscriptOnlyPackage(unittest.TestCase):
+    def setUp(self):
+        self.temp_dir = Path(tempfile.mkdtemp(prefix="lecture_digest_transcript_only_"))
+        self.transcript = self.temp_dir / "transcript.txt"
+        self.transcript.write_text("[00:00] Gerência de configuração e baseline.", encoding="utf-8")
+
+    def tearDown(self):
+        shutil.rmtree(self.temp_dir, ignore_errors=True)
+
+    def test_prepares_without_recording(self):
+        output = self.temp_dir / "lecture"
+
+        links = transcript_prepare_mod.prepare_transcript(self.transcript, output, "Aula sem gravação")
+
+        self.assertEqual(links, 0)
+        self.assertTrue((output / "transcript.md").is_file())
+        self.assertTrue((output / "README.md").is_file())
+        self.assertFalse((output / "frames").exists())
+        self.assertIn("transcript-only", (output / "README.md").read_text(encoding="utf-8"))
+
+    def test_links_ingested_slides_without_recording(self):
+        output = self.temp_dir / "lecture"
+        (output / "materials").mkdir(parents=True)
+        (output / "materials" / "slides.pdf").write_bytes(b"placeholder PDF")
+
+        with patch.object(
+            transcript_prepare_mod.slide_materials,
+            "write_slide_links",
+            return_value=1,
+        ) as write_links:
+            links = transcript_prepare_mod.prepare_transcript(self.transcript, output)
+
+        self.assertEqual(links, 1)
+        write_links.assert_called_once()
+        readme = (output / "README.md").read_text(encoding="utf-8")
+        self.assertIn("materials/slides.pdf", readme)
 
 
 class TestTranscriptNormalization(unittest.TestCase):
@@ -54,12 +159,12 @@ class TestTranscriptNormalization(unittest.TestCase):
 
         self.assertEqual(entries, [{"type": "timestamp", "sec": 0, "text": "Speaker 1: Welcome to class."}])
 
-    def test_wispr_timestamp_reset_requires_manual_rebase(self):
+    def test_backward_wispr_timestamps_require_a_corrected_source(self):
         wispr_sample = """[00:10:00] Speaker 1: End of the first segment.
 [00:00:00] Speaker 1: Wispr restarted after a pause.
 """
 
-        with self.assertRaisesRegex(ValueError, "timeline goes backwards"):
+        with self.assertRaisesRegex(ValueError, "timestamps go backwards"):
             norm_mod.normalize_transcript(wispr_sample)
 
     def test_timestamped_text_parsing(self):
@@ -128,7 +233,7 @@ class TestInputContract(unittest.TestCase):
         )
         output = self.temp_dir / "output"
 
-        with self.assertRaisesRegex(ValueError, "timeline goes backwards"):
+        with self.assertRaisesRegex(ValueError, "timestamps go backwards"):
             prepare_mod.prepare_lecture(
                 video_paths=[self.recording],
                 transcript_path=self.transcript,
@@ -406,27 +511,34 @@ class TestEndToEndPipeline(unittest.TestCase):
 
     def test_prepare_lecture_e2e(self):
         out_lecture_dir = self.temp_dir / "lecture_output"
+        materials_dir = out_lecture_dir / "materials"
+        materials_dir.mkdir(parents=True)
+        (materials_dir / "slides.pdf").write_bytes(b"placeholder PDF supplied by the earlier ingestion step")
 
         # Run prepare_lecture with offset 04:37 (277 seconds)
-        prepare_mod.prepare_lecture(
-            video_paths=[self.video_path],
-            transcript_path=self.transcript_path,
-            output_dir=out_lecture_dir,
-            offsets=["00:04:37"],
-            interval_seconds=5.0,
-            phash_threshold=6,
-            max_interval_seconds=30.0,
-            quality=2,
-            max_edge=320,
-            keep_raw=False,
-            title="Algorithms Lecture 01"
-        )
+        fake_pages = [prepare_mod.slide_mod.SlidePage(1, "Algorithms complexity chart")]
+        with patch.object(prepare_mod.slide_mod, "extract_slide_pages", return_value=fake_pages):
+            prepare_mod.prepare_lecture(
+                video_paths=[self.video_path],
+                transcript_path=self.transcript_path,
+                output_dir=out_lecture_dir,
+                offsets=["00:04:37"],
+                interval_seconds=5.0,
+                phash_threshold=6,
+                max_interval_seconds=30.0,
+                quality=2,
+                max_edge=320,
+                keep_raw=False,
+                title="Algorithms Lecture 01"
+            )
 
         # Check deliverables
         self.assertTrue((out_lecture_dir / "README.md").is_file())
         self.assertTrue((out_lecture_dir / "transcript.md").is_file())
         self.assertTrue((out_lecture_dir / "frames").is_dir())
         self.assertTrue((out_lecture_dir / "frames" / "index.csv").is_file())
+        self.assertTrue((out_lecture_dir / "materials" / "slides.pdf").is_file())
+        self.assertTrue((out_lecture_dir / "materials" / "slide-links.md").is_file())
         # o pacote é fonte read-only: o vault é o destino, não uma pasta output/
         self.assertFalse((out_lecture_dir / "output").exists())
 
@@ -438,6 +550,7 @@ class TestEndToEndPipeline(unittest.TestCase):
         self.assertIn("index.csv", readme_text)
         self.assertIn("What the frames show", readme_text)
         self.assertIn("<vault>/raw/lectures", readme_text)
+        self.assertIn("materials/slides.pdf", readme_text)
         self.assertNotIn("/Users/", readme_text)
 
         # Check transcript.md content

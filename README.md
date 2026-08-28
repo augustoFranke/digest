@@ -1,24 +1,27 @@
 # Lecture Digest — Context Compiler
 
-Compila gravações de tela do macOS (`recording.mov`) e a transcrição `.txt` exportada pelo Wispr Flow em um **pacote de contexto de aula estruturado e legível por agentes de IA**, sem OCR ou banco vetorial.
+Compila gravações de tela do macOS (`recording.mov`), PDFs de slides e a transcrição `.txt` exportada pelo Wispr Flow em um **pacote de contexto de aula estruturado e legível por agentes de IA**, sem OCR ou banco vetorial.
 
 O problema que o projeto resolve não é apenas resumir uma transcrição. Quando o professor diz “essa linha aqui” ou “como vocês podem ver”, o texto perdeu o objeto apontado. O pacote alinha a fala aos frames da tela para que o agente consiga recuperar esse contexto visual.
 
 ## Escopo real
 
-- Entrada: uma ou mais gravações `.mov`, na ordem em que aconteceram.
+- Entrada: uma ou mais gravações `.mov`, na ordem em que aconteceram — ou apenas a transcrição para aulas sem gravação de tela.
 - Transcrição: um único `.txt` timestampado exportado pelo Wispr Flow.
+- Material opcional: um PDF de slides, que pode ser ingerido antes da transcrição.
 - Alinhamento: exatamente um `--offsets` por gravação.
-- Saída: `README.md`, `transcript.md`, frames JPEG deduplicados e `frames/index.csv`.
+- Saída: `README.md`, `transcript.md`, frames JPEG deduplicados, `frames/index.csv` e, quando houver slides, `materials/` indexado por página.
 
-O Wispr reinicia o relógio quando a transcrição é pausada. Quando isso acontece, a transcrição precisa ser rebased manualmente para uma timeline contínua antes da compilação. O compilador não tenta adivinhar pausas, remover conversas capturadas por acidente ou inferir offsets: essas decisões ficam explícitas e verificáveis.
+No Notetaker atual do Wispr, pausar e retomar preserva a mesma timeline; a pausa aparece como uma lacuna no transcript. Se um arquivo combinado tiver timestamps que voltam no tempo, o compilador para antes de criar saída: exporte uma sessão única ou corrija a fonte antes de compilar. O compilador não tenta adivinhar offsets ou remover conversas capturadas por acidente.
 
 ---
 
 ## 🎯 Arquitetura
 
 ```text
-recording.mov + Wispr transcript.txt
+slides.pdf (opcional, antes da aula)
+            ↓
+recording.mov + Wispr transcript.txt (depois da aula)
             ↓
      preparação local
        (recorte + escala)
@@ -41,6 +44,12 @@ lectures/2026-08-25-nome-da-disciplina/
 │   ├── 00-04-37.jpg    # Recortados na tela compartilhada, com o timestamp real da aula
 │   ├── 00-04-52.jpg
 │   └── ...
+├── materials/          # opcional: material do professor
+│   ├── slides.pdf
+│   ├── slides.md       # texto extraído por página
+│   ├── slides-index.csv
+│   ├── pages/           # página renderizada como imagem
+│   └── slide-links.md  # candidatos transcript ↔ páginas
 └── (nada mais — o vault é o destino)
 ```
 
@@ -51,7 +60,7 @@ lectures/2026-08-25-nome-da-disciplina/
 ### Pré-requisitos
 - Python 3.12+
 - `ffmpeg` instalado no PATH (`brew install ffmpeg`)
-- Dependências Python: `pillow`, `imagehash`, `numpy` (gerenciadas via `uv` ou `pip`)
+- Dependências Python: `pillow`, `imagehash`, `numpy`, `pypdf` (gerenciadas via `uv` ou `pip`)
 
 ```bash
 uv sync
@@ -90,6 +99,28 @@ uv run prepare_lecture.py parte-1.mov parte-2.mov -t transcript.txt \
 
 O comando falha antes de criar a saída se a quantidade de offsets não for igual à de gravações.
 
+### Slides antes da transcrição
+
+Se o professor compartilhar um PDF antes ou durante a aula, ingira-o imediatamente:
+
+```bash
+uv run ingest_slides.py slides.pdf \
+  -o lectures/2026-08-28-gerencia-encontro-03
+```
+
+Essa etapa não exige `.mov` nem `.txt`. Ela preserva o PDF em `materials/slides.pdf`, extrai o texto por página para `slides.md`, renderiza páginas como imagens quando `pdftoppm` está disponível e registra quais páginas não tiveram texto extraído.
+
+Depois da aula, rode o pipeline normal apontando para o mesmo diretório. Se `materials/slides.pdf` existir, o compilador cria `materials/slide-links.md` com candidatos lexicais para cada trecho da transcrição. Eles precisam ser conferidos no PDF ou em `materials/pages/`: não são prova de que uma página estava na tela naquele segundo.
+
+Se a aula não tiver gravação de tela, finalize apenas a transcrição no mesmo diretório:
+
+```bash
+uv run prepare_transcript.py transcript.txt \
+  -o lectures/2026-08-28-gerencia-encontro-03
+```
+
+Esse comando cria `transcript.md`, atualiza o `README.md` como pacote transcript-only e, se houver slides ingeridos, gera os candidatos em `materials/slide-links.md`.
+
 ### Opção 2: executar passo a passo
 
 #### 1. Normalizar a transcrição do Wispr
@@ -97,6 +128,20 @@ O comando falha antes de criar a saída se a quantidade de offsets não for igua
 Converte o `.txt` timestampado para `transcript.md`:
 ```bash
 uv run 01_normalize_transcript.py transcript.txt -o lectures/minha-aula/transcript.md
+```
+
+#### 0. Ingerir slides (opcional)
+
+Para preparar o material sem gravação ou transcript:
+
+```bash
+uv run ingest_slides.py slides.pdf -o lectures/minha-aula
+```
+
+Para aulas sem `.mov`, use depois:
+
+```bash
+uv run prepare_transcript.py transcript.txt -o lectures/minha-aula
 ```
 
 #### 2. Extrair Frames Brutos da Gravação (1 a cada 5s)

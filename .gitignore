@@ -13,9 +13,10 @@ wheels/
 lectures/
 /frames/
 
-# Raw classroom captures. Only the fictional fixture under examples/ is public.
+# Raw classroom captures and professor materials. Only the fictional fixture under examples/ is public.
 *.mov
 *.txt
+*.pdf
 !examples/*.txt
 
 .DS_Store
