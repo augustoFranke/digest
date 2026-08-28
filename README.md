@@ -1,13 +1,24 @@
-# Lecture Digest — Context Compiler (V0)
+# Lecture Digest — Context Compiler
 
-Compila gravações de tela (`recording.mp4`) e transcrições de aula (`transcript.txt` / `.srt` / `.vtt` / `.json`) em um **pacote de contexto de aula estruturado e legível por agentes de IA**, sem intermediários, OCR desnecessário ou bancos vetoriais pesados.
+Compila gravações de tela do macOS (`recording.mov`) e a transcrição `.txt` exportada pelo Wispr Flow em um **pacote de contexto de aula estruturado e legível por agentes de IA**, sem OCR ou banco vetorial.
+
+O problema que o projeto resolve não é apenas resumir uma transcrição. Quando o professor diz “essa linha aqui” ou “como vocês podem ver”, o texto perdeu o objeto apontado. O pacote alinha a fala aos frames da tela para que o agente consiga recuperar esse contexto visual.
+
+## Escopo real
+
+- Entrada: uma ou mais gravações `.mov`, na ordem em que aconteceram.
+- Transcrição: um único `.txt` timestampado exportado pelo Wispr Flow.
+- Alinhamento: exatamente um `--offsets` por gravação.
+- Saída: `README.md`, `transcript.md`, frames JPEG deduplicados e `frames/index.csv`.
+
+O Wispr reinicia o relógio quando a transcrição é pausada. Quando isso acontece, a transcrição precisa ser rebased manualmente para uma timeline contínua antes da compilação. O compilador não tenta adivinhar pausas, remover conversas capturadas por acidente ou inferir offsets: essas decisões ficam explícitas e verificáveis.
 
 ---
 
-## 🎯 Arquitetura V0
+## 🎯 Arquitetura
 
 ```text
-screen recording + transcript
+recording.mov + Wispr transcript.txt
             ↓
      preparação local
        (recorte + escala)
@@ -35,10 +46,10 @@ lectures/2026-08-25-nome-da-disciplina/
 
 ---
 
-## 🚀 Como Usar
+## 🚀 Como usar
 
 ### Pré-requisitos
-- Python 3.10+
+- Python 3.12+
 - `ffmpeg` instalado no PATH (`brew install ffmpeg`)
 - Dependências Python: `pillow`, `imagehash`, `numpy` (gerenciadas via `uv` ou `pip`)
 
@@ -48,10 +59,10 @@ uv sync
 
 ---
 
-### Opção 1: Pipeline Completo em 1 Comando
+### Opção 1: pipeline completo em um comando
 
 ```bash
-uv run prepare_lecture.py recording.mp4 -t transcript.txt \
+uv run prepare_lecture.py recording.mov -t transcript.txt \
   --offsets 00:04:37 \
   -o lectures/2026-08-25-algoritmos \
   --title "Algoritmos e Estruturas de Dados - Aula 01"
@@ -69,10 +80,21 @@ Flags que controlam o tamanho do pacote:
 
 ---
 
-### Opção 2: Executar Passo a Passo Modular
+Para várias gravações, passe os arquivos e os offsets correspondentes na mesma ordem:
 
-#### 1. Normalizar Transcrição
-Converte `.txt`, `.srt`, `.vtt` ou Whisper `.json` para `transcript.md`:
+```bash
+uv run prepare_lecture.py parte-1.mov parte-2.mov -t transcript.txt \
+  --offsets 00:04:37 00:42:10 \
+  -o lectures/2026-08-25-algoritmos
+```
+
+O comando falha antes de criar a saída se a quantidade de offsets não for igual à de gravações.
+
+### Opção 2: executar passo a passo
+
+#### 1. Normalizar a transcrição do Wispr
+
+Converte o `.txt` timestampado para `transcript.md`:
 ```bash
 uv run 01_normalize_transcript.py transcript.txt -o lectures/minha-aula/transcript.md
 ```
@@ -80,7 +102,7 @@ uv run 01_normalize_transcript.py transcript.txt -o lectures/minha-aula/transcri
 #### 2. Extrair Frames Brutos da Gravação (1 a cada 5s)
 Extrai frames brutos usando `ffmpeg`:
 ```bash
-uv run 02_extract_frames.py recording.mp4 -o lectures/minha-aula/frames/raw --interval 5
+uv run 02_extract_frames.py recording.mov -o lectures/minha-aula/frames/raw --interval 5
 ```
 
 #### 3. Recortar a Tela Compartilhada e Reduzir a Resolução
@@ -125,7 +147,7 @@ uv run 04_dedupe_and_rename.py lectures/minha-aula/frames/cropped \
 
 ---
 
-## 🤖 Workflow com o Agente de IA
+## 🤖 Workflow com o agente de IA
 
 Abra o agente multimodal (Antigravity, Claude, Codex, etc.) no diretório da aula:
 
@@ -137,15 +159,26 @@ E faça seus pedidos diretamente:
 
 > *"Read README.md and transcript.md. Study the lecture and inspect the relevant frames in frames/ when visual context is necessary."*
 
-O destino da nota é o vault, não este diretório — ver `AGENTS.md`.
+O destino da nota é `<vault>/raw/lectures`, não este diretório — ver `AGENTS.md`. Configure `<vault>` para o seu vault do Obsidian antes de usar o protocolo de estudo.
 
 > *"At 37:20 the professor discusses an edge case with 'essa linha aqui'. Explain what they mean, inspecting nearby frames."*
 
----
+## Limites e intervenção humana
+
+- O offset de cada `.mov` é informado manualmente. Um offset errado desalinha todos os frames daquele segmento.
+- A detecção de crop é heurística. Quando não confia no resultado, mantém o frame inteiro; inspecione um frame do início e outro do fim antes de aceitar o pacote.
+- A transcrição é a fonte verbal primária, mas pode conter erros de ASR. Nomes próprios e comandos devem ser conferidos contra os frames e o material da aula.
+- A preparação é local. O destino e a privacidade da inferência dependem do agente escolhido para abrir o pacote.
+
+## Privacidade
+
+`lectures/` é ignorado pelo Git porque pode conter falas, nomes, avatares, chats, códigos de reunião, materiais do professor e trabalhos de alunos. Não publique um pacote real, mesmo quando o crop parece ter removido a interface da chamada: o fallback deliberadamente preserva o frame inteiro.
+
+Use somente dados fictícios em demonstrações públicas. [`examples/wispr-transcript.txt`](examples/wispr-transcript.txt) é uma entrada mínima sanitizada; ela pode ser combinada com uma gravação `.mov` criada por você.
 
 ## 🧪 Testes
 
-Execute a suíte de testes com vídeo sintético e transcrições:
+Execute a suíte completa. O teste end-to-end gera uma gravação `.mov` sintética com FFmpeg e verifica o pacote resultante:
 ```bash
 uv run python3 -m unittest discover tests
 ```

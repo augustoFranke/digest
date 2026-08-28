@@ -2,9 +2,8 @@
 """
 01_normalize_transcript.py
 
-Normalizes various transcript formats (plain text with timestamps, inline timestamps,
-SRT, VTT, Whisper JSON, paused/resumed multi-part lectures) into a clean, standardized
-Markdown file (transcript.md) with searchable timestamp headers.
+Normalizes the timestamped plain-text export produced by Wispr Flow into a clean,
+standardized Markdown file (transcript.md) with searchable timestamp headers.
 
 Example output:
     # Transcript
@@ -17,11 +16,10 @@ Example output:
 """
 
 import argparse
-import json
 import re
 import sys
 from pathlib import Path
-from typing import List, Tuple, Optional, Union, Dict, Any
+from typing import Any, Dict, List, Optional
 
 
 def parse_timestamp_to_seconds(ts_str: str) -> Optional[int]:
@@ -65,79 +63,49 @@ def format_seconds_to_timestamp(seconds: int, always_hours: bool = True) -> str:
     return f"{m:02d}:{s:02d}"
 
 
-def parse_srt(content: str) -> List[Dict[str, Any]]:
-    """
-    Parses SubRip (.srt) subtitles into entries.
-    """
-    entries = []
-    blocks = re.split(r'\n\s*\n', content.strip())
-    srt_time_pat = re.compile(r'(\d{1,2}:\d{2}:\d{2}[,\.]\d{3})\s*-->\s*(\d{1,2}:\d{2}:\d{2}[,\.]\d{3})')
-
-    for block in blocks:
-        lines = [line.strip() for line in block.strip().splitlines() if line.strip()]
-        if not lines:
-            continue
-        time_match = None
-        text_lines = []
-        for line in lines:
-            m = srt_time_pat.search(line)
-            if m:
-                time_match = m
-            elif time_match:
-                text_lines.append(line)
-
-        if time_match and text_lines:
-            start_ts = time_match.group(1)
-            sec = parse_timestamp_to_seconds(start_ts)
-            if sec is not None:
-                entries.append({"type": "timestamp", "sec": sec, "text": " ".join(text_lines)})
-
-    return entries
+TIMESTAMP_TOKEN = re.compile(
+    r'(\[\d{1,2}:\d{2}\s*(?:AM|PM)\]\s*--\s*(?:Paused|Resumed)\s*--(?:\s*\[\d{1,2}:\d{2}\s*(?:AM|PM)\]\s*--\s*(?:Paused|Resumed)\s*--)*|'
+    r'\[(\d{1,2}:\d{2}(?::\d{2})?)\]|'
+    r'(?:^|[\n\r])\s*(?:##\s*)?(\d{1,2}:\d{2}(?::\d{2})?)\b[\s\-:]*)',
+    re.MULTILINE,
+)
 
 
-def parse_vtt(content: str) -> List[Dict[str, Any]]:
-    """
-    Parses WebVTT (.vtt) subtitles into entries.
-    """
-    entries = []
-    vtt_time_pat = re.compile(r'((?:\d{1,2}:)?\d{2}:\d{2}[,\.]\d{3})\s*-->\s*((?:\d{1,2}:)?\d{2}:\d{2}[,\.]\d{3})')
-    blocks = re.split(r'\n\s*\n', content.strip())
-
-    for block in blocks:
-        lines = [line.strip() for line in block.strip().splitlines() if line.strip()]
-        if not lines or lines[0].startswith('WEBVTT') or lines[0].startswith('NOTE'):
-            continue
-        time_match = None
-        text_lines = []
-        for line in lines:
-            m = vtt_time_pat.search(line)
-            if m:
-                time_match = m
-            elif time_match:
-                text_lines.append(line)
-
-        if time_match and text_lines:
-            start_ts = time_match.group(1)
-            sec = parse_timestamp_to_seconds(start_ts)
-            if sec is not None:
-                entries.append({"type": "timestamp", "sec": sec, "text": " ".join(text_lines)})
-
-    return entries
+def _append_text(token: Dict[str, Any], text: str) -> None:
+    """Adds non-empty transcript text to a timestamp or pause marker."""
+    text = text.strip()
+    if not text:
+        return
+    token["text"] = f"{token.get('text', '')} {text}".strip()
 
 
-def parse_whisper_json(content: str) -> List[Dict[str, Any]]:
-    """
-    Parses Whisper verbose JSON format containing 'segments'.
-    """
-    data = json.loads(content)
-    entries = []
-    segments = data.get('segments', [])
-    for seg in segments:
-        start_sec = int(round(seg.get('start', 0)))
-        text = seg.get('text', '').strip()
-        if text:
-            entries.append({"type": "timestamp", "sec": start_sec, "text": text})
-    return entries
+def _token_from_match(match: re.Match[str]) -> Dict[str, Any]:
+    """Converts one Wispr timestamp or pause marker into a transcript token."""
+    matched_text = match.group(0).strip()
+    timestamp = match.group(2) or match.group(3)
+    if "--" in matched_text and ("Paused" in matched_text or "Resumed" in matched_text):
+        return {"type": "marker", "marker": matched_text, "text": ""}
+
+    seconds = parse_timestamp_to_seconds(timestamp)
+    if seconds is None:
+        raise ValueError(f"Invalid Wispr timestamp: '{timestamp}'")
+    return {"type": "timestamp", "sec": seconds, "raw_ts": timestamp, "text": ""}
+
+
+def _preamble_and_start(content: str) -> tuple[List[Dict[str, Any]], int]:
+    """Returns an optional preamble and the point where timestamp parsing begins."""
+    first_match = TIMESTAMP_TOKEN.search(content)
+    if first_match is None:
+        return [], 0
+    preamble = content[:first_match.start()].strip()
+    tokens = [{"type": "preamble", "text": preamble}] if preamble else []
+    return tokens, first_match.start()
+
+
+def _append_preceding_text(tokens: List[Dict[str, Any]], content: str, start: int, end: int) -> None:
+    """Assigns text between timestamp tokens to the preceding transcript token."""
+    if tokens and tokens[-1].get("type") in ("timestamp", "marker"):
+        _append_text(tokens[-1], content[start:end])
 
 
 def parse_inline_and_text(content: str) -> List[Dict[str, Any]]:
@@ -145,102 +113,44 @@ def parse_inline_and_text(content: str) -> List[Dict[str, Any]]:
     Parses timestamped text formats, including multi-line or inline timestamps
     (e.g., [04:37] Speaker: ..., 04:37 - Speaker, ## 04:37) and pause/resume markers.
     """
-    # Pattern matching:
-    # 1. Pause/Resume markers: [7:57 PM] -- Paused -- ...
-    # 2. Bracketed timestamps: [04:37] or [00:04:37]
-    # 3. Markdown/Line-start timestamps: ## 04:37 or ^04:37 or \n04:37
-    pattern = re.compile(
-        r'(\[\d{1,2}:\d{2}\s*(?:AM|PM)\]\s*--\s*(?:Paused|Resumed)\s*--(?:\s*\[\d{1,2}:\d{2}\s*(?:AM|PM)\]\s*--\s*(?:Paused|Resumed)\s*--)*|'
-        r'\[(\d{1,2}:\d{2}(?::\d{2})?)\]|'
-        r'(?:^|[\n\r])\s*(?:##\s*)?(\d{1,2}:\d{2}(?::\d{2})?)\b[\s\-:]*)',
-        re.MULTILINE
-    )
+    tokens, last_pos = _preamble_and_start(content)
 
-    tokens: List[Dict[str, Any]] = []
-    last_pos = 0
-
-    # Extract initial summary/preamble if present before the first transcript timestamp
-    first_match = pattern.search(content)
-    if first_match and first_match.start() > 0:
-        preamble = content[:first_match.start()].strip()
-        if preamble:
-            tokens.append({"type": "preamble", "text": preamble})
-        last_pos = first_match.start()
-
-    for match in pattern.finditer(content):
+    for match in TIMESTAMP_TOKEN.finditer(content):
         start, end = match.span()
-        matched_str = match.group(0).strip()
-        ts_group = match.group(2) or match.group(3)
-
-        # Preceding text belongs to previous token
-        if tokens and tokens[-1].get("type") in ("timestamp", "marker"):
-            preceding = content[last_pos:start].strip()
-            if preceding:
-                if tokens[-1].get("text"):
-                    tokens[-1]["text"] += " " + preceding
-                else:
-                    tokens[-1]["text"] = preceding
-
-        if "--" in matched_str and ("Paused" in matched_str or "Resumed" in matched_str):
-            tokens.append({
-                "type": "marker",
-                "marker": matched_str,
-                "text": ""
-            })
-        elif ts_group:
-            sec = parse_timestamp_to_seconds(ts_group)
-            if sec is not None:
-                tokens.append({
-                    "type": "timestamp",
-                    "sec": sec,
-                    "raw_ts": ts_group,
-                    "text": ""
-                })
+        _append_preceding_text(tokens, content, last_pos, start)
+        tokens.append(_token_from_match(match))
         last_pos = end
 
-    # Add remaining text after last timestamp
-    if tokens and last_pos < len(content):
-        remaining = content[last_pos:].strip()
-        if remaining:
-            if tokens[-1].get("text"):
-                tokens[-1]["text"] += " " + remaining
-            else:
-                tokens[-1]["text"] = remaining
+    _append_preceding_text(tokens, content, last_pos, len(content))
 
-    if not tokens:
-        tokens.append({"type": "timestamp", "sec": 0, "text": content.strip()})
-
-    return tokens
+    if tokens:
+        return tokens
+    return [{"type": "timestamp", "sec": 0, "text": content.strip()}]
 
 
-def normalize_transcript(content: str, filename_hint: str = "") -> List[Dict[str, Any]]:
-    """
-    Detects format and parses content into a list of entry dictionaries.
-    """
+def normalize_transcript(content: str) -> List[Dict[str, Any]]:
+    """Parses a Wispr plain-text export into timestamped entries."""
     stripped = content.strip()
     if not stripped:
         return []
+    entries = parse_inline_and_text(stripped)
 
-    if (filename_hint.endswith('.json') or stripped.startswith('{')) and '"segments"' in stripped:
-        try:
-            return parse_whisper_json(stripped)
-        except Exception:
-            pass
+    previous = None
+    for entry in entries:
+        if entry.get("type") != "timestamp":
+            continue
+        current = entry["sec"]
+        if previous is not None and current < previous:
+            raise ValueError(
+                "Wispr transcript timeline goes backwards. Rebase paused/resumed "
+                "segments onto one continuous timeline before compiling."
+            )
+        previous = current
 
-    if filename_hint.endswith('.srt') or ('-->' in stripped and re.search(r'\d{2}:\d{2}:\d{2},\d{3}', stripped)):
-        parsed = parse_srt(stripped)
-        if parsed:
-            return parsed
-
-    if filename_hint.endswith('.vtt') or stripped.startswith('WEBVTT') or ('-->' in stripped and re.search(r'\d{2}:\d{2}\.\d{3}', stripped)):
-        parsed = parse_vtt(stripped)
-        if parsed:
-            return parsed
-
-    return parse_inline_and_text(stripped)
+    return entries
 
 
-def generate_markdown(entries: List[Dict[str, Any]], merge_window_seconds: int = 0) -> str:
+def generate_markdown(entries: List[Dict[str, Any]]) -> str:
     """
     Formats parsed entries into standardized markdown.
     """
@@ -276,11 +186,10 @@ def generate_markdown(entries: List[Dict[str, Any]], merge_window_seconds: int =
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Normalize raw lecture transcripts (SRT, VTT, JSON, TXT, MD) into a clean, searchable transcript.md"
+        description="Normalize a Wispr Flow .txt export into a searchable transcript.md"
     )
-    parser.add_argument("input", help="Path to input transcript file (e.g. transcript.txt, audio.srt, whisper.json)")
+    parser.add_argument("input", help="Path to the Wispr Flow .txt export")
     parser.add_argument("-o", "--output", help="Path to output transcript.md (defaults to stdout)")
-    parser.add_argument("--merge-window", type=int, default=0, help="Optional window in seconds to merge nearby short subtitles (default: 0)")
 
     args = parser.parse_args()
 
@@ -288,14 +197,21 @@ def main():
     if not input_path.is_file():
         print(f"Error: Input file '{args.input}' does not exist.", file=sys.stderr)
         sys.exit(1)
+    if input_path.suffix.lower() != ".txt":
+        print(f"Error: Transcript must be a Wispr Flow .txt export: '{args.input}'.", file=sys.stderr)
+        sys.exit(1)
 
     try:
         content = input_path.read_text(encoding="utf-8")
     except UnicodeDecodeError:
         content = input_path.read_text(encoding="latin-1")
 
-    entries = normalize_transcript(content, filename_hint=input_path.name.lower())
-    markdown_output = generate_markdown(entries, merge_window_seconds=args.merge_window)
+    try:
+        entries = normalize_transcript(content)
+        markdown_output = generate_markdown(entries)
+    except ValueError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        sys.exit(1)
 
     if args.output:
         out_path = Path(args.output)

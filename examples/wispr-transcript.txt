@@ -1,0 +1,7 @@
+[00:00:00] Professor: Nesta demonstração vamos validar um formulário simples.
+
+[00:00:05] Professor: Essa linha aqui impede que o campo seja enviado vazio.
+
+[00:00:12] Professor: Quando a validação falha, a mensagem aparece abaixo do campo.
+
+[00:00:18] Professor: Agora o formulário pode ser enviado.

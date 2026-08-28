@@ -1,7 +1,7 @@
 [project]
 name = "lecture-digest"
 version = "0.1.0"
-description = "Add your description here"
+description = "Compile Wispr transcripts and screen recordings into timestamp-aligned context for AI study agents"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [

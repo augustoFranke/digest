@@ -92,6 +92,102 @@ def get_phash(image_path: Path):
         return imagehash.phash(img)
 
 
+def _frame_groups(frame_files: List[Path]) -> Dict[int, List[Path]]:
+    """Groups extraction filenames by their originating recording."""
+    groups: Dict[int, List[Path]] = {}
+    for frame_path in frame_files:
+        match = re.match(r"vid(\d+)_frame_(\d+)", frame_path.name)
+        video_index = int(match.group(1)) - 1 if match else 0
+        groups.setdefault(video_index, []).append(frame_path)
+
+    for files in groups.values():
+        files.sort(key=_frame_number)
+    return groups
+
+
+def _frame_number(frame_path: Path) -> int:
+    """Returns the extraction sequence number, or zero for an unknown name."""
+    match = re.search(r"frame_(\d+)", frame_path.name)
+    return int(match.group(1)) if match else 0
+
+
+def _video_time(frame_path: Path, position: int, interval_seconds: float) -> float:
+    """Derives a frame's recording-relative time from its extraction filename."""
+    number = _frame_number(frame_path)
+    return (number - 1 if number else position) * interval_seconds
+
+
+def _should_keep_frame(current_hash, previous_hash, video_time: float, previous_time: Optional[float], phash_threshold: int, max_interval_seconds: float) -> bool:
+    """Keeps the first frame, visible changes, and periodic continuity frames."""
+    if previous_hash is None:
+        return True
+    return current_hash - previous_hash >= phash_threshold or video_time - previous_time >= max_interval_seconds
+
+
+def _destination_filename(lecture_time: int, video_index: int, existing: set[str]) -> str:
+    """Returns a non-conflicting timestamp filename for an overlapping recording."""
+    filename = format_seconds_to_filename(lecture_time)
+    collision = 1
+    while filename in existing:
+        filename = format_seconds_to_filename(lecture_time, suffix=f"p{video_index + 1}_{collision}")
+        collision += 1
+    return filename
+
+
+def _write_index(output_dir: Path, records: List[Tuple[str, str, int, float]]) -> Path:
+    """Writes the frame lookup index sorted by lecture timestamp."""
+    index_path = output_dir / "index.csv"
+    with open(index_path, mode="w", newline="", encoding="utf-8") as index_file:
+        writer = csv.writer(index_file)
+        writer.writerow(["timestamp", "file"])
+        writer.writerows((timestamp, filename) for timestamp, filename, _, _ in records)
+    return index_path
+
+
+def _offset_list(offsets: Union[int, List[int]]) -> List[int]:
+    """Normalizes the public single-offset and multi-offset forms."""
+    return [offsets] if isinstance(offsets, int) else list(offsets)
+
+
+def _dedupe_group(
+    frame_files: List[Path],
+    video_index: int,
+    offset_seconds: int,
+    interval_seconds: float,
+    phash_threshold: int,
+    max_interval_seconds: float,
+    output_dir: Path,
+    existing_filenames: set[str],
+) -> List[Tuple[str, str, int, float]]:
+    """Deduplicates one recording group and returns its saved frame records."""
+    print(f"\n[Video Group {video_index + 1}] Processing {len(frame_files)} frames with offset = {offset_seconds}s ({format_seconds_to_timestamp(offset_seconds)})...")
+    records: List[Tuple[str, str, int, float]] = []
+    last_hash = None
+    last_time = None
+
+    for position, frame_path in enumerate(frame_files):
+        video_time = _video_time(frame_path, position, interval_seconds)
+        current_hash = get_phash(frame_path)
+        if not _should_keep_frame(current_hash, last_hash, video_time, last_time, phash_threshold, max_interval_seconds):
+            continue
+
+        lecture_time = int(round(video_time + offset_seconds))
+        filename = _destination_filename(lecture_time, video_index, existing_filenames)
+        existing_filenames.add(filename)
+        shutil.copy2(frame_path, output_dir / filename)
+        records.append((format_seconds_to_timestamp(lecture_time), filename, lecture_time, video_time))
+        last_hash = current_hash
+        last_time = video_time
+    return records
+
+
+def _clean_raw_directory(raw_dir: Path, output_dir: Path, clean_raw: bool) -> None:
+    """Removes intermediates only when requested and distinct from the output."""
+    if clean_raw and raw_dir.resolve() != output_dir.resolve():
+        shutil.rmtree(raw_dir)
+        print(f"  Cleaned raw directory: {raw_dir}")
+
+
 def dedupe_and_rename_frames(
     raw_dir: Path,
     output_dir: Path,
@@ -119,89 +215,25 @@ def dedupe_and_rename_frames(
         print(f"No image frames found in '{raw_dir}'.", file=sys.stderr)
         return []
 
-    if isinstance(offsets, int):
-        offsets_list = [offsets]
-    else:
-        offsets_list = list(offsets)
-
+    offsets_list = _offset_list(offsets)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Group files by video index if prefixed with vid<N>_
-    video_groups: Dict[int, List[Path]] = {}
-    for f in all_frame_files:
-        match_vid = re.match(r'vid(\d+)_frame_(\d+)', f.name)
-        if match_vid:
-            vid_idx = int(match_vid.group(1)) - 1
-            video_groups.setdefault(vid_idx, []).append(f)
-        else:
-            video_groups.setdefault(0, []).append(f)
-
-    # Sort each group numerically
-    for vid_idx in video_groups:
-        video_groups[vid_idx].sort(
-            key=lambda p: int(re.search(r'frame_(\d+)', p.name).group(1)) if re.search(r'frame_(\d+)', p.name) else 0
-        )
+    video_groups = _frame_groups(all_frame_files)
 
     saved_records = []
     seen_dest_filenames = set()
 
-    for vid_idx in sorted(video_groups.keys()):
-        frame_files = video_groups[vid_idx]
+    for vid_idx in sorted(video_groups):
         offset_sec = offsets_list[vid_idx] if vid_idx < len(offsets_list) else offsets_list[-1]
-
-        print(f"\n[Video Group {vid_idx + 1}] Processing {len(frame_files)} frames with offset = {offset_sec}s ({format_seconds_to_timestamp(offset_sec)})...")
-
-        last_saved_hash = None
-        last_saved_video_time = None
-
-        for idx, frame_path in enumerate(frame_files):
-            num_match = re.search(r'frame_(\d+)', frame_path.name)
-            if num_match:
-                frame_num = int(num_match.group(1))
-                video_time = (frame_num - 1) * interval_seconds
-            else:
-                video_time = idx * interval_seconds
-
-            lecture_time_sec = int(round(video_time + offset_sec))
-            curr_hash = get_phash(frame_path)
-
-            should_save = False
-            if last_saved_hash is None:
-                should_save = True
-            else:
-                hash_dist = curr_hash - last_saved_hash
-                time_diff = video_time - last_saved_video_time
-                if hash_dist >= phash_threshold or time_diff >= max_interval_seconds:
-                    should_save = True
-
-            if should_save:
-                dest_filename = format_seconds_to_filename(lecture_time_sec)
-                # Handle possible collision if two videos overlap in timestamp
-                collision_count = 1
-                while dest_filename in seen_dest_filenames:
-                    dest_filename = format_seconds_to_filename(lecture_time_sec, suffix=f"p{vid_idx+1}_{collision_count}")
-                    collision_count += 1
-
-                seen_dest_filenames.add(dest_filename)
-                dest_path = output_dir / dest_filename
-                shutil.copy2(frame_path, dest_path)
-
-                ts_str = format_seconds_to_timestamp(lecture_time_sec)
-                saved_records.append((ts_str, dest_filename, lecture_time_sec, video_time))
-
-                last_saved_hash = curr_hash
-                last_saved_video_time = video_time
+        saved_records.extend(_dedupe_group(
+            video_groups[vid_idx], vid_idx, offset_sec, interval_seconds,
+            phash_threshold, max_interval_seconds, output_dir, seen_dest_filenames,
+        ))
 
     # Sort saved records by lecture time
     saved_records.sort(key=lambda r: r[2])
 
-    # Generate index.csv in output_dir
-    index_csv_path = output_dir / "index.csv"
-    with open(index_csv_path, mode="w", newline="", encoding="utf-8") as f:
-        writer = csv.writer(f)
-        writer.writerow(["timestamp", "file"])
-        for ts_str, filename, _, _ in saved_records:
-            writer.writerow([ts_str, filename])
+    index_csv_path = _write_index(output_dir, saved_records)
 
     total_raw = len(all_frame_files)
     total_kept = len(saved_records)
@@ -213,9 +245,7 @@ def dedupe_and_rename_frames(
     print(f"  Saved to:          {output_dir}")
     print(f"  Index generated:   {index_csv_path}")
 
-    if clean_raw and raw_dir.resolve() != output_dir.resolve():
-        shutil.rmtree(raw_dir)
-        print(f"  Cleaned raw directory: {raw_dir}")
+    _clean_raw_directory(raw_dir, output_dir, clean_raw)
 
     return saved_records
 

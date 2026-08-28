@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Unit and integration tests for lecture-digest V0 pipeline.
+Unit and integration tests for the lecture-digest pipeline.
 """
 
 import shutil
@@ -34,43 +34,33 @@ class TestTranscriptNormalization(unittest.TestCase):
         self.assertEqual(norm_mod.format_seconds_to_timestamp(277), "00:04:37")
         self.assertEqual(norm_mod.format_seconds_to_timestamp(3661), "01:01:01")
 
-    def test_srt_parsing(self):
-        srt_sample = """1
-00:00:00,000 --> 00:00:03,000
-Welcome to class.
-
-2
-00:04:37,500 --> 00:04:42,000
-Look at this code example.
+    def test_wispr_pause_markers_are_preserved(self):
+        wispr_sample = """[00:00] Speaker 1: First segment.
+[7:57 PM] -- Paused --
+[8:01 PM] -- Resumed --
+[04:37] Speaker 1: Second segment with explanation.
 """
-        entries = norm_mod.parse_srt(srt_sample)
-        self.assertEqual(len(entries), 2)
-        self.assertEqual(entries[0]["sec"], 0)
-        self.assertEqual(entries[0]["text"], "Welcome to class.")
-        self.assertEqual(entries[1]["sec"], 277)
-        self.assertEqual(entries[1]["text"], "Look at this code example.")
-
+        entries = norm_mod.normalize_transcript(wispr_sample)
         md = norm_mod.generate_markdown(entries)
-        self.assertIn("# Transcript", md)
-        self.assertIn("## 00:00:00", md)
-        self.assertIn("## 00:04:37", md)
-        self.assertIn("Look at this code example.", md)
 
-    def test_vtt_parsing(self):
-        vtt_sample = """WEBVTT
-
-00:00.000 --> 00:04.000
-First segment.
-
-04:37.000 --> 04:45.000
-Second segment with explanation.
-"""
-        entries = norm_mod.parse_vtt(vtt_sample)
-        self.assertEqual(len(entries), 2)
         self.assertEqual(entries[0]["sec"], 0)
-        self.assertEqual(entries[0]["text"], "First segment.")
-        self.assertEqual(entries[1]["sec"], 277)
-        self.assertEqual(entries[1]["text"], "Second segment with explanation.")
+        self.assertEqual(entries[-1]["sec"], 277)
+        self.assertIn("Paused", md)
+        self.assertIn("Resumed", md)
+        self.assertIn("## 00:04:37", md)
+
+    def test_plain_wispr_text_without_timestamp_starts_at_zero(self):
+        entries = norm_mod.normalize_transcript("Speaker 1: Welcome to class.")
+
+        self.assertEqual(entries, [{"type": "timestamp", "sec": 0, "text": "Speaker 1: Welcome to class."}])
+
+    def test_wispr_timestamp_reset_requires_manual_rebase(self):
+        wispr_sample = """[00:10:00] Speaker 1: End of the first segment.
+[00:00:00] Speaker 1: Wispr restarted after a pause.
+"""
+
+        with self.assertRaisesRegex(ValueError, "timeline goes backwards"):
+            norm_mod.normalize_transcript(wispr_sample)
 
     def test_timestamped_text_parsing(self):
         text_sample = """
@@ -86,6 +76,67 @@ We can see the algorithm complexity is O(N).
         self.assertEqual(entries[0]["sec"], 0)
         self.assertEqual(entries[1]["sec"], 277)
         self.assertEqual(entries[2]["sec"], 318)
+
+
+class TestInputContract(unittest.TestCase):
+    def setUp(self):
+        self.temp_dir = Path(tempfile.mkdtemp(prefix="lecture_digest_inputs_"))
+        self.recording = self.temp_dir / "recording.mov"
+        self.transcript = self.temp_dir / "transcript.txt"
+        self.recording.touch()
+        self.transcript.write_text("[00:00] Test", encoding="utf-8")
+
+    def tearDown(self):
+        shutil.rmtree(self.temp_dir, ignore_errors=True)
+
+    def test_accepts_mov_txt_and_one_offset_per_recording(self):
+        prepare_mod.validate_inputs([self.recording], self.transcript, ["00:00:00"])
+
+    def test_rejects_non_mov_recording(self):
+        recording = self.temp_dir / "recording.mp4"
+        recording.touch()
+
+        with self.assertRaisesRegex(ValueError, r"\.mov"):
+            prepare_mod.validate_inputs([recording], self.transcript, ["00:00:00"])
+
+    def test_rejects_non_txt_transcript(self):
+        transcript = self.temp_dir / "transcript.srt"
+        transcript.touch()
+
+        with self.assertRaisesRegex(ValueError, r"\.txt"):
+            prepare_mod.validate_inputs([self.recording], transcript, ["00:00:00"])
+
+    def test_rejects_missing_offset_before_creating_output(self):
+        second_recording = self.temp_dir / "recording-2.mov"
+        second_recording.touch()
+        output = self.temp_dir / "output"
+
+        with self.assertRaisesRegex(ValueError, "one --offsets value per recording"):
+            prepare_mod.prepare_lecture(
+                video_paths=[self.recording, second_recording],
+                transcript_path=self.transcript,
+                output_dir=output,
+                offsets=["00:00:00"],
+            )
+
+        self.assertFalse(output.exists())
+
+    def test_rejects_wispr_timestamp_reset_before_creating_output(self):
+        self.transcript.write_text(
+            "[00:10:00] First segment.\n[00:00:00] Restarted segment.",
+            encoding="utf-8",
+        )
+        output = self.temp_dir / "output"
+
+        with self.assertRaisesRegex(ValueError, "timeline goes backwards"):
+            prepare_mod.prepare_lecture(
+                video_paths=[self.recording],
+                transcript_path=self.transcript,
+                output_dir=output,
+                offsets=["00:00:00"],
+            )
+
+        self.assertFalse(output.exists())
 
 
 class TestDeduplicationAndRenaming(unittest.TestCase):
@@ -324,7 +375,7 @@ class TestEndToEndPipeline(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.temp_dir = Path(tempfile.mkdtemp(prefix="lecture_digest_test_"))
-        cls.video_path = cls.temp_dir / "recording.mp4"
+        cls.video_path = cls.temp_dir / "recording.mov"
         cls.transcript_path = cls.temp_dir / "transcript.txt"
 
         # Generate a synthetic 15-second test video using ffmpeg
@@ -386,6 +437,8 @@ class TestEndToEndPipeline(unittest.TestCase):
         self.assertIn("frames/00-18-42.jpg", readme_text)
         self.assertIn("index.csv", readme_text)
         self.assertIn("What the frames show", readme_text)
+        self.assertIn("<vault>/raw/lectures", readme_text)
+        self.assertNotIn("/Users/", readme_text)
 
         # Check transcript.md content
         transcript_md = (out_lecture_dir / "transcript.md").read_text(encoding="utf-8")

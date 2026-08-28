@@ -2,7 +2,7 @@
 """
 prepare_lecture.py
 
-Lecture Context Compiler (V0)
+Lecture Context Compiler
 
 Compiles raw lecture video recording(s) and transcript into an agent-ready lecture context folder:
     <lecture_dir>/
@@ -14,6 +14,9 @@ Compiles raw lecture video recording(s) and transcript into an agent-ready lectu
         └── ...
 
 The package is read-only source material. Study notes go to the Obsidian vault; see AGENTS.md.
+
+Input contract: one or more macOS screen recordings in .mov format, one timestamped
+Wispr Flow .txt export, and exactly one transcript offset per recording.
 """
 
 import argparse
@@ -29,6 +32,31 @@ norm_mod = SourceFileLoader("01_norm", str(curr_dir / "01_normalize_transcript.p
 extract_mod = SourceFileLoader("02_ext", str(curr_dir / "02_extract_frames.py")).load_module()
 crop_mod = SourceFileLoader("03_crop", str(curr_dir / "03_crop_frames.py")).load_module()
 dedupe_mod = SourceFileLoader("04_dedupe", str(curr_dir / "04_dedupe_and_rename.py")).load_module()
+
+RECORDING_SUFFIX = ".mov"
+TRANSCRIPT_SUFFIX = ".txt"
+
+
+def validate_inputs(video_paths: List[Path], transcript_path: Path, offsets: List[str]) -> None:
+    """Validates the real capture contract before creating any output."""
+    if not video_paths:
+        raise ValueError("At least one .mov screen recording is required.")
+    for video_path in video_paths:
+        if not video_path.is_file():
+            raise FileNotFoundError(f"Video file not found: {video_path}")
+        if video_path.suffix.lower() != RECORDING_SUFFIX:
+            raise ValueError(f"Screen recording must be a .mov file: {video_path}")
+
+    if not transcript_path.is_file():
+        raise FileNotFoundError(f"Transcript file not found: {transcript_path}")
+    if transcript_path.suffix.lower() != TRANSCRIPT_SUFFIX:
+        raise ValueError(f"Transcript must be a Wispr Flow .txt export: {transcript_path}")
+
+    if len(offsets) != len(video_paths):
+        raise ValueError(
+            f"Expected one --offsets value per recording: got {len(offsets)} offset(s) "
+            f"for {len(video_paths)} .mov file(s)."
+        )
 
 
 def describe_crop(crop_boxes: dict) -> str:
@@ -54,8 +82,8 @@ def describe_crop(crop_boxes: dict) -> str:
 
     return (
         "Frames show only the region of the screen that carried the lecture. The video call's "
-        "own interface — window chrome, participant tiles, control bar, letterbox — was detected "
-        "as static and removed, and the result was scaled down.\n\n"
+        "own interface — window chrome, participant tiles, control bar, letterbox — fell outside "
+        "the detected lecture region and was removed, and the result was scaled down.\n\n"
         + "\n".join(lines)
         + "\n\nSo a frame is not a screenshot of the whole screen: the shared window's tab bar and "
         "address bar are usually outside the crop. Read what is in the frame; do not infer that "
@@ -67,7 +95,6 @@ def generate_readme(
     lecture_title: str,
     offsets_str: List[str],
     offsets_seconds: List[int],
-    total_frames: int,
     crop_boxes: dict
 ) -> str:
     """
@@ -96,7 +123,7 @@ This directory contains structured context and materials from one lecture, compi
 
 ## Sources
 
-- `transcript.md`: Complete timestamped transcript.
+- `transcript.md`: Wispr transcript normalized onto the lecture timeline.
 - `frames/`: Keyframe screenshots extracted from the professor's shared screen.
 - `frames/index.csv`: Fast lookup index of available frame timestamps.
 
@@ -134,7 +161,7 @@ When interpreting statements in `transcript.md` such as:
 This package is source material, not a destination. Nothing is written back into this
 directory. The study note goes to the Obsidian vault:
 
-`/Users/augustodoregofranke/Library/Mobile Documents/iCloud~md~obsidian/Documents/Vault/raw/lectures/YYYY-MM-DD Disciplina — Tópico.md`
+`<vault>/raw/lectures/YYYY-MM-DD Disciplina — Tópico.md`
 
 and the concepts the lecture taught are promoted into `<vault>/wiki/`.
 
@@ -173,12 +200,17 @@ def prepare_lecture(
     else:
         offsets_str_list = list(offsets)
 
-    # Pad offsets if fewer than videos
-    while len(offsets_str_list) < len(video_paths):
-        offsets_str_list.append(offsets_str_list[-1])
+    validate_inputs(video_paths, transcript_path, offsets_str_list)
 
     offsets_seconds = [dedupe_mod.parse_offset_string(o) for o in offsets_str_list]
     lecture_title = title or output_dir.name
+
+    try:
+        transcript_content = transcript_path.read_text(encoding="utf-8")
+    except UnicodeDecodeError:
+        transcript_content = transcript_path.read_text(encoding="latin-1")
+    entries = norm_mod.normalize_transcript(transcript_content)
+    transcript_md = norm_mod.generate_markdown(entries)
 
     output_dir.mkdir(parents=True, exist_ok=True)
     frames_dir = output_dir / "frames"
@@ -196,13 +228,6 @@ def prepare_lecture(
 
     # Step 1: Normalize Transcript
     print("\n[Step 1/5] Normalizing transcript...")
-    try:
-        content = transcript_path.read_text(encoding="utf-8")
-    except UnicodeDecodeError:
-        content = transcript_path.read_text(encoding="latin-1")
-
-    entries = norm_mod.normalize_transcript(content, filename_hint=transcript_path.name.lower())
-    transcript_md = norm_mod.generate_markdown(entries)
     transcript_out_path = output_dir / "transcript.md"
     transcript_out_path.write_text(transcript_md, encoding="utf-8")
     print(f"✓ Saved {len(entries)} transcript sections to {transcript_out_path}")
@@ -250,7 +275,6 @@ def prepare_lecture(
         lecture_title=lecture_title,
         offsets_str=offsets_str_list,
         offsets_seconds=offsets_seconds,
-        total_frames=len(saved_records),
         crop_boxes=crop_boxes
     )
     readme_path = output_dir / "README.md"
@@ -268,12 +292,17 @@ def prepare_lecture(
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Prepare a complete Lecture Context package from video(s) and transcript for AI agent consumption."
+        description="Compile .mov screen recording(s) and a Wispr Flow .txt transcript into agent-ready lecture context."
     )
-    parser.add_argument("videos", nargs="+", help="Path to video recording file(s)")
-    parser.add_argument("-t", "--transcript", required=True, help="Path to transcript file (e.g. transcript.txt, transcript.md)")
-    parser.add_argument("-o", "--output-dir", default="lecture", help="Output directory for lecture context (default: lecture)")
-    parser.add_argument("--offsets", nargs="+", default=["00:00:00"], help="Recording start offset(s) in transcript (e.g. '00:04:37')")
+    parser.add_argument("videos", nargs="+", help="Path to screen recording .mov file(s), in chronological order")
+    parser.add_argument("-t", "--transcript", required=True, help="Path to the timestamped Wispr Flow .txt export")
+    parser.add_argument(
+        "-o",
+        "--output-dir",
+        default="lectures/lecture",
+        help="Output directory for lecture context (default: lectures/lecture)",
+    )
+    parser.add_argument("--offsets", nargs="+", default=["00:00:00"], help="One transcript start offset per .mov recording (e.g. '00:04:37')")
     parser.add_argument("--title", default="", help="Lecture title (optional, defaults to output directory name)")
     parser.add_argument("--interval", type=float, default=5.0, help="Interval in seconds between raw frame extractions (default: 5.0)")
     parser.add_argument("--phash-threshold", type=int, default=6, help="pHash hamming distance threshold (default: 6)")

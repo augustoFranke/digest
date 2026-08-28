@@ -11,5 +11,11 @@ wheels/
 
 # Generated lecture packages (recordings, frames, transcripts)
 lectures/
+/frames/
+
+# Raw classroom captures. Only the fictional fixture under examples/ is public.
+*.mov
+*.txt
+!examples/*.txt
 
 .DS_Store

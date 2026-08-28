@@ -7,9 +7,11 @@ Questions about this repo's code, pipeline, or tooling are normal engineering wo
 
 ## Destination
 
-Write lecture notes only here:
+`<vault>` means the user's Obsidian vault. In this workspace it resolves through
+`~/Learning/vault`; other installations must configure an equivalent path before
+studying a package. Write lecture notes only here:
 
-`/Users/augustodoregofranke/Library/Mobile Documents/iCloud~md~obsidian/Documents/Vault/raw/lectures`
+`<vault>/raw/lectures`
 
 One markdown file per lecture. The vault treats `raw/` as source material — these notes *are* that source.
 
@@ -31,12 +33,12 @@ A package looks like:
 lectures/<date>-<slug>/
 ├── README.md
 ├── transcript.md
-└── frames/            # HH-MM-SS.jpg + index.csv
+└── frames/            # optional: HH-MM-SS.jpg + index.csv
 ```
 
 The package is read-only source. Nothing is written back into it — the vault is the sink.
 
-Read `README.md` and `transcript.md` before writing. When the professor says "isso aqui", "essa linha", "como vocês podem ver", open the nearest preceding frame. Transcript is the verbal source; frames recover what they were pointing at.
+Read `README.md` and `transcript.md` before writing. When frames exist and the professor says "isso aqui", "essa linha", "como vocês podem ver", open the nearest preceding frame. Transcript is the verbal source; frames recover what they were pointing at. A transcript-only package is valid when the class had no screen recording.
 
 ## Then write (or open) the note — before answering
 

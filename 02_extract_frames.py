@@ -2,7 +2,7 @@
 """
 02_extract_frames.py
 
-Extracts raw frames from one or more video recordings at regular intervals
+Extracts raw frames from one or more .mov screen recordings at regular intervals
 (default: 1 frame every 5 seconds) using ffmpeg into a raw frames folder.
 """
 
@@ -31,6 +31,8 @@ def extract_frames_single(
 
     if not video_path.is_file():
         raise FileNotFoundError(f"Video file not found: {video_path}")
+    if video_path.suffix.lower() != ".mov":
+        raise ValueError(f"Recording must be a .mov file: {video_path}")
 
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -104,7 +106,7 @@ def main():
     parser = argparse.ArgumentParser(
         description="Extract raw frames from video recording(s) every N seconds using ffmpeg."
     )
-    parser.add_argument("videos", nargs="+", help="Path to video file(s) (e.g. recording.mp4)")
+    parser.add_argument("videos", nargs="+", help="Path to screen recording .mov file(s)")
     parser.add_argument("-o", "--output-dir", default="frames/raw", help="Output directory for raw frames (default: frames/raw)")
     parser.add_argument("--interval", type=float, default=5.0, help="Interval in seconds between frames (default: 5.0)")
     parser.add_argument("-q", "--quality", type=int, default=2, help="JPEG quality 1-31 where 1 is best (default: 2)")

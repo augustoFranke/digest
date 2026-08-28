@@ -204,6 +204,69 @@ def _component_containing(mask, seed: Tuple[int, int]):
         current = grown
 
 
+def _activity_mask(change, verbose: bool):
+    """Returns cells whose repeated change is strong enough to be lecture content."""
+    peak = float(np.percentile(change, 99.5))
+    if peak < 2.0:
+        if verbose:
+            print("  Frames barely change over time; keeping the full frame.")
+        return None
+
+    mask = _erode(change > max(ACTIVITY_FLOOR, ACTIVITY_THRESHOLD_FRACTION * peak))
+    if not mask.any() and verbose:
+        print("  No region survived the activity threshold; keeping the full frame.")
+    return mask if mask.any() else None
+
+
+def _content_cells(change, mask) -> Box:
+    """Finds and trims the connected active region around the densest area."""
+    weighted_change = np.where(mask, change, 0.0)
+    seed = np.unravel_index(int(np.argmax(_box_blur(weighted_change, radius=3))), change.shape)
+    if not mask[seed]:
+        seed = np.unravel_index(int(np.argmax(weighted_change)), change.shape)
+
+    component = _component_containing(mask, seed)
+    rows = np.where(component.any(axis=1))[0]
+    cols = np.where(component.any(axis=0))[0]
+    cells = (
+        max(0, int(cols.min()) - 1),
+        max(0, int(rows.min()) - 1),
+        min(change.shape[1] - 1, int(cols.max()) + 1),
+        min(change.shape[0] - 1, int(rows.max()) + 1),
+    )
+    return _trim_quiet_edges(change, cells)
+
+
+def _cell_box_to_frame_box(cells: Box, downscale: int, full_width: int, full_height: int) -> Box:
+    """Scales inclusive analysis cells back to image coordinates."""
+    left, top, right, bottom = cells
+    return (
+        left * downscale,
+        top * downscale,
+        min(full_width, (right + 1) * downscale),
+        min(full_height, (bottom + 1) * downscale),
+    )
+
+
+def _report_detected_box(box: Box, full_width: int, full_height: int, verbose: bool) -> None:
+    """Explains a successful detection and flags a potentially broad crop."""
+    if not verbose:
+        return
+    left, top, right, bottom = box
+    kept = ((right - left) * (bottom - top)) / float(full_width * full_height)
+    print(f"  Detected content box {left},{top} -> {right},{bottom} "
+          f"({right - left}x{bottom - top}, {kept:.0%} of the frame)")
+    if kept <= SUSPICIOUS_AREA_FRACTION:
+        return
+    print("  That is most of the frame. Two things cause it, and they need opposite responses:")
+    print("    - The window moved during the recording, or the call's layout changed (tiles "
+          "from the side to the top, a chat panel opening). The box is then the union of every "
+          "position the lecture occupied, and it is correct — no single crop does better.")
+    print("    - The sample covers too short a stretch. Over a few minutes the shared screen "
+          "sits still while the webcams move, so the detection separates nothing.")
+    print("  Look at a frame from early and one from late before overriding with --box.")
+
+
 def detect_content_box(
     frame_files: List[Path],
     sample: int = DEFAULT_SAMPLE,
@@ -229,38 +292,12 @@ def detect_content_box(
         return None
 
     change, full_w, full_h = _change_map(frame_files, sample, downscale)
-
-    peak = float(np.percentile(change, 99.5))
-    if peak < 2.0:
-        if verbose:
-            print("  Frames barely change over time; keeping the full frame.")
+    mask = _activity_mask(change, verbose)
+    if mask is None:
         return None
 
-    mask = _erode(change > max(ACTIVITY_FLOOR, ACTIVITY_THRESHOLD_FRACTION * peak))
-    if not mask.any():
-        if verbose:
-            print("  No region survived the activity threshold; keeping the full frame.")
-        return None
-
-    # Seed on the densest activity rather than the single hottest pixel, so a
-    # lone cursor or a blinking caret cannot capture the search.
-    seed = np.unravel_index(int(np.argmax(_box_blur(np.where(mask, change, 0.0), radius=3))), change.shape)
-    if not mask[seed]:
-        seed = np.unravel_index(int(np.argmax(np.where(mask, change, 0.0))), change.shape)
-
-    component = _component_containing(mask, seed)
-    rows = np.where(component.any(axis=1))[0]
-    cols = np.where(component.any(axis=0))[0]
-
-    # +1 cell each side gives back what the erosion ate and spares the content edges.
-    cells = (
-        max(0, int(cols.min()) - 1),
-        max(0, int(rows.min()) - 1),
-        min(change.shape[1] - 1, int(cols.max()) + 1),
-        min(change.shape[0] - 1, int(rows.max()) + 1),
-    )
-    left_c, top_c, right_c, bottom_c = _trim_quiet_edges(change, cells)
-
+    cells = _content_cells(change, mask)
+    left_c, top_c, right_c, bottom_c = cells
     share = float(change[top_c:bottom_c + 1, left_c:right_c + 1].sum() / change.sum())
     if share < MIN_ACTIVITY_SHARE:
         if verbose:
@@ -268,27 +305,10 @@ def detect_content_box(
                   "lecture is probably not what was detected; keeping the full frame.")
         return None
 
-    left = left_c * downscale
-    top = top_c * downscale
-    right = min(full_w, (right_c + 1) * downscale)
-    bottom = min(full_h, (bottom_c + 1) * downscale)
-
-    box = (left, top, right, bottom)
+    box = _cell_box_to_frame_box(cells, downscale, full_w, full_h)
     if not _box_is_plausible(box, full_w, full_h, verbose=verbose):
         return None
-
-    if verbose:
-        kept = ((right - left) * (bottom - top)) / float(full_w * full_h)
-        print(f"  Detected content box {left},{top} -> {right},{bottom} "
-              f"({right - left}x{bottom - top}, {kept:.0%} of the frame)")
-        if kept > SUSPICIOUS_AREA_FRACTION:
-            print("  That is most of the frame. Two things cause it, and they need opposite responses:")
-            print("    - The window moved during the recording, or the call's layout changed (tiles "
-                  "from the side to the top, a chat panel opening). The box is then the union of every "
-                  "position the lecture occupied, and it is correct — no single crop does better.")
-            print("    - The sample covers too short a stretch. Over a few minutes the shared screen "
-                  "sits still while the webcams move, so the detection separates nothing.")
-            print("  Look at a frame from early and one from late before overriding with --box.")
+    _report_detected_box(box, full_w, full_h, verbose)
     return box
 
 
