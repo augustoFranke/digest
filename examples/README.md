@@ -5,7 +5,7 @@
 Para uma demonstração pública, grave um `.mov` curto mostrando código ou slides criados por você e alinhe o início da gravação ao timestamp correspondente:
 
 ```bash
-uv run prepare_lecture.py demo.mov \
+uv run digest.py demo.mov \
   -t examples/wispr-transcript.txt \
   --offsets 00:00:05 \
   -o lectures/demo \

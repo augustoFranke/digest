@@ -1,229 +1,196 @@
-# Lecture Digest — Context Compiler
+# Digest
 
-Compila gravações de tela do macOS (`recording.mov`), PDFs de slides e a transcrição `.txt` exportada pelo Wispr Flow em um **pacote de contexto de aula estruturado e legível por agentes de IA**, sem OCR ou banco vetorial.
+Compila transcrições, vídeos e slides em um pacote de contexto para agentes de IA. A fala fica em `transcript.md`; frames e páginas de slides recuperam o contexto visual de expressões como “essa linha aqui”. O programa prepara as fontes; o agente estuda o pacote e escreve a nota no vault conforme `AGENTS.md`.
 
-O problema que o projeto resolve não é apenas resumir uma transcrição. Quando o professor diz “essa linha aqui” ou “como vocês podem ver”, o texto perdeu o objeto apontado. O pacote alinha a fala aos frames da tela para que o agente consiga recuperar esse contexto visual.
+Há **um único comando**, `uv run digest.py`, e três flags de entrada: `--transcript`, `--transcribe` e `--slides`. Os vídeos são argumentos posicionais. Coloque-os antes das flags, na ordem cronológica.
 
-## Escopo real
+## Instalação
 
-- Entrada: uma ou mais gravações `.mov`, na ordem em que aconteceram — ou apenas a transcrição para aulas sem gravação de tela.
-- Transcrição: um único `.txt` timestampado exportado pelo Wispr Flow.
-- Material opcional: um PDF de slides, que pode ser ingerido antes da transcrição.
-- Alinhamento: exatamente um `--offsets` por gravação.
-- Saída: `README.md`, `transcript.md`, frames JPEG deduplicados, `frames/index.csv` e, quando houver slides, `materials/` indexado por página.
-
-No Notetaker atual do Wispr, pausar e retomar preserva a mesma timeline; a pausa aparece como uma lacuna no transcript. Se um arquivo combinado tiver timestamps que voltam no tempo, o compilador para antes de criar saída: exporte uma sessão única ou corrija a fonte antes de compilar. O compilador não tenta adivinhar offsets ou remover conversas capturadas por acidente.
-
----
-
-## 🎯 Arquitetura
-
-```text
-slides.pdf (opcional, antes da aula)
-            ↓
-recording.mov + Wispr transcript.txt (depois da aula)
-            ↓
-     preparação local
-       (recorte + escala)
-            ↓
-    lecture-context/
-            ↓
-     agente abre pasta
-            ↓
-   nota no vault + wiki
-```
-
-### Estrutura do Pacote Gerado
-
-```text
-lectures/2026-08-25-nome-da-disciplina/
-├── README.md           # Guia de alinhamento e instruções para o agente multimodal
-├── transcript.md       # Transcrição normalizada com cabeçalhos ## HH:MM:SS
-├── frames/
-│   ├── index.csv       # Mapeamento rápido (timestamp, file)
-│   ├── 00-04-37.jpg    # Recortados na tela compartilhada, com o timestamp real da aula
-│   ├── 00-04-52.jpg
-│   └── ...
-├── materials/          # opcional: material do professor
-│   ├── slides.pdf
-│   ├── slides.md       # texto extraído por página
-│   ├── slides-index.csv
-│   ├── pages/           # página renderizada como imagem
-│   └── slide-links.md  # candidatos transcript ↔ páginas
-└── (nada mais — o vault é o destino)
-```
-
----
-
-## 🚀 Como usar
-
-### Pré-requisitos
-- Python 3.12+
-- `ffmpeg` instalado no PATH (`brew install ffmpeg`)
-- Dependências Python: `pillow`, `imagehash`, `numpy`, `pypdf` (gerenciadas via `uv` ou `pip`)
+Python 3.12+ e [uv](https://docs.astral.sh/uv/). Use o lockfile do projeto:
 
 ```bash
 uv sync
 ```
 
----
-
-### Opção 1: pipeline completo em um comando
+Para qualquer modo com vídeo, instale FFmpeg (inclui `ffprobe`):
 
 ```bash
-uv run prepare_lecture.py recording.mov -t transcript.txt \
+brew install ffmpeg
+```
+
+Para **gerar** uma transcrição a partir do áudio, instale também o extra opcional:
+
+```bash
+uv sync --extra audio
+```
+
+Os exemplos com `--transcribe` usam `uv run --extra audio` para manter esse extra instalado. Os demais modos não carregam o reconhecedor de voz.
+
+Slides PDF usam `pypdf`, já incluído. Para renderizar imagens das páginas, instale `brew install poppler`; sem ele, PDF e texto continuam disponíveis. Para PowerPoint, instale `brew install --cask libreoffice`.
+
+## Escolha do modo
+
+### 1. Transcrição pronta + vídeo (com ou sem áudio)
+
+Use quando já houver um `.txt` timestampado, como a exportação do Wispr Flow. O áudio do vídeo é ignorado; a fonte verbal é exatamente a transcrição fornecida.
+
+```bash
+uv run digest.py recording.mov --transcript transcript.txt \
   --offsets 00:04:37 \
-  -o lectures/2026-08-25-algoritmos \
-  --title "Algoritmos e Estruturas de Dados - Aula 01"
+  -o lectures/2026-09-10-algoritmos \
+  --title "Algoritmos — Busca binária"
 ```
 
-Flags que controlam o tamanho do pacote:
+`--offsets 00:04:37` significa que o início do vídeo corresponde a `00:04:37` da transcrição. Não há frames para o período anterior. São aceitos vídeos locais que FFmpeg consiga ler, como MOV, MP4, MKV e WebM; a presença das trilhas é verificada, em vez de depender apenas da extensão.
 
-| Flag | Padrão | O que faz |
-|---|---|---|
-| `--max-edge` | `1568` | Maior aresta do frame final, em pixels. `0` desliga a redução. |
-| `--frame-quality` | `82` | Qualidade JPEG do frame final (1–95). |
-| `--crop-box` | — | `left,top,right,bottom`: pula a detecção e recorta nessa caixa. |
-| `--no-crop` | — | Mantém o frame inteiro; só reduz a escala. |
-| `--keep-raw` | — | Preserva os frames em resolução original, que por padrão são apagados assim que o recorte termina. |
+### 2. Vídeo com áudio, sem transcrição pronta
 
----
-
-Para várias gravações, passe os arquivos e os offsets correspondentes na mesma ordem:
+`--transcribe` extrai a primeira trilha de áudio e gera a transcrição localmente. Os frames e a fala usam a mesma linha do tempo.
 
 ```bash
-uv run prepare_lecture.py parte-1.mov parte-2.mov -t transcript.txt \
-  --offsets 00:04:37 00:42:10 \
-  -o lectures/2026-08-25-algoritmos
+uv run --extra audio digest.py aula.mp4 --transcribe \
+  --language pt --model small \
+  -o lectures/2026-09-10-algoritmos
 ```
 
-O comando falha antes de criar a saída se a quantidade de offsets não for igual à de gravações.
+O padrão é português (`pt`), modelo `small`, CPU com quantização int8. `--language auto` detecta o idioma por gravação. `--model` aceita o nome de um modelo do faster-whisper ou o diretório de um modelo já convertido para CTranslate2.
 
-### Slides antes da transcrição
+A primeira execução com um nome de modelo baixa seus pesos; o áudio é processado na máquina e não é enviado a uma API. Execuções posteriores reutilizam o cache. Para execução sem rede, passe um diretório de modelo completo já baixado. Veja a [documentação oficial do faster-whisper](https://github.com/SYSTRAN/faster-whisper#usage).
 
-Se o professor compartilhar um PDF antes ou durante a aula, ingira-o imediatamente:
+O reconhecedor é uma dependência opcional para manter o fluxo com transcrição pronta leve. Usa CPU também em Macs Apple Silicon; modelos maiores custam mais memória e tempo. Não há diarização nem tradução. A transcrição automática pode errar termos técnicos; confira-os nos frames e slides.
+
+Vídeo sem trilha de áudio, falha de decodificação ou ausência de fala reconhecida resulta em erro, sem publicar um pacote incompleto. Um WAV mono de 16 kHz é temporário e removido ao encerrar o processamento. Pausas e atraso inicial da trilha de áudio são preservados na linha do tempo.
+
+### 3. Apenas transcrição pronta
+
+Use quando não houver vídeo:
 
 ```bash
-uv run ingest_slides.py slides.pdf \
-  -o lectures/2026-08-28-gerencia-encontro-03
+uv run digest.py --transcript transcript.txt \
+  -o lectures/2026-09-10-algoritmos
 ```
 
-Essa etapa não exige `.mov` nem `.txt`. Ela preserva o PDF em `materials/slides.pdf`, extrai o texto por página para `slides.md`, renderiza páginas como imagens quando `pdftoppm` está disponível e registra quais páginas não tiveram texto extraído.
+A saída contém `README.md` e `transcript.md`, sem `frames/`. O README avisa que não há evidência visual temporal.
 
-Depois da aula, rode o pipeline normal apontando para o mesmo diretório. Se `materials/slides.pdf` existir, o compilador cria `materials/slide-links.md` com candidatos lexicais para cada trecho da transcrição. Eles precisam ser conferidos no PDF ou em `materials/pages/`: não são prova de que uma página estava na tela naquele segundo.
-
-Se a aula não tiver gravação de tela, finalize apenas a transcrição no mesmo diretório:
+Para obter esse mesmo tipo de pacote a partir de um vídeo com áudio, acrescente `--no-frames`:
 
 ```bash
-uv run prepare_transcript.py transcript.txt \
-  -o lectures/2026-08-28-gerencia-encontro-03
+uv run --extra audio digest.py aula.mp4 --transcribe --no-frames \
+  -o lectures/2026-09-10-algoritmos
 ```
 
-Esse comando cria `transcript.md`, atualiza o `README.md` como pacote transcript-only e, se houver slides ingeridos, gera os candidatos em `materials/slide-links.md`.
+### 4. Slides antes da gravação ou junto das outras fontes
 
-### Opção 2: executar passo a passo
-
-#### 1. Normalizar a transcrição do Wispr
-
-Converte o `.txt` timestampado para `transcript.md`:
-```bash
-uv run 01_normalize_transcript.py transcript.txt -o lectures/minha-aula/transcript.md
-```
-
-#### 0. Ingerir slides (opcional)
-
-Para preparar o material sem gravação ou transcript:
+Ingerir material antecipadamente não exige transcrição nem vídeo:
 
 ```bash
-uv run ingest_slides.py slides.pdf -o lectures/minha-aula
+uv run digest.py --slides slides.pdf -o lectures/2026-09-10-algoritmos
+# Também aceita: --slides slides.pptx
 ```
 
-Para aulas sem `.mov`, use depois:
+Depois, finalize no **mesmo diretório**, usando qualquer um dos modos acima. O PDF já ingerido será associado à transcrição. Ou faça tudo em uma execução:
 
 ```bash
-uv run prepare_transcript.py transcript.txt -o lectures/minha-aula
+uv run --extra audio digest.py aula.mp4 --transcribe --slides slides.pptx \
+  -o lectures/2026-09-10-algoritmos
 ```
 
-#### 2. Extrair Frames Brutos da Gravação (1 a cada 5s)
-Extrai frames brutos usando `ffmpeg`:
-```bash
-uv run 02_extract_frames.py recording.mov -o lectures/minha-aula/frames/raw --interval 5
-```
+O PowerPoint é convertido para PDF pelo LibreOffice headless, com perfil temporário próprio e timeout de 5 minutos; `materials/slides.pptx` preserva o original. A conversão permite que busca, renderização e associação usem sempre páginas PDF. Animações e notas do apresentador não são representadas no PDF. Se a conversão falhar, exporte o deck para PDF e forneça esse arquivo. Outros formatos de slides, como `.key`, `.odp` e `.ppt`, não são aceitos.
 
-#### 3. Recortar a Tela Compartilhada e Reduzir a Resolução
-A aula é gravada dentro de uma chamada, então a maior parte de cada frame é moldura: barra do navegador, ladrilhos de participantes, controles do Meet, tarja preta. Quase nada disso fica realmente parado — o relógio anda, a barra de controles aparece e some, as webcams mexem. A pergunta útil não é *o que muda*, e sim **o que se reescreve o tempo todo**.
+O LibreOffice permite conversão sem diálogo interativo de acesso a arquivos. A renderização pode diferir da do PowerPoint; confira a versão preservada quando houver dúvida visual.
 
-O passo amostra os frames de cada gravação, mede quanto cada pixel muda **de uma amostra para a seguinte** e fica com a região que muda tão forte quanto as células mais agitadas do frame — a tela compartilhada, que redesenha linhas inteiras de texto enquanto um ladrilho desloca um rosto por alguns níveis. Depois reduz a escala até a maior aresta caber em `--max-edge`.
+`materials/slide-links.md` contém candidatos por sobreposição lexical, nunca prova de que uma página estava na tela naquele segundo. Verifique os candidatos no PDF ou nas imagens de páginas. Slides sem texto extraível são marcados; não há OCR.
 
-```bash
-uv run 03_crop_frames.py lectures/minha-aula/frames/raw \
-  -o lectures/minha-aula/frames/cropped \
-  --max-edge 1568 \
-  -q 82
-```
+## Alinhamento e múltiplos vídeos
 
-O padrão de `--max-edge` é **1568 px** porque é a resolução acima da qual modelos de visão reduzem a imagem por conta própria — guardar mais que isso ocupa disco sem entregar detalhe nenhum ao agente. Em tela Retina isso sozinho corta a maior parte do peso.
+Cada frame e trecho reconhecido recebe `tempo no vídeo + offset`. O offset é um início absoluto na linha do tempo do pacote, não uma duração nem um deslocamento acumulativo.
 
-A detecção é feita **por gravação**, já que cada uma pode ter um layout diferente. Se ela errar, `--box left,top,right,bottom` recorta na marra e `--no-crop` mantém o frame inteiro. Quando a detecção não confia no resultado (poucos frames, frames parados, região implausível), ela mantém o frame inteiro e diz isso na saída.
-
-**Diferença entre amostras consecutivas, não desvio-padrão sobre a gravação toda.** Os dois são altos na tela compartilhada, mas só o desvio-padrão é alto em algo que ficou em dois estados ao longo de uma hora. Basta o professor entrar em tela cheia uma vez aos 45 minutos para *todo* pixel do frame — tarja preta inclusive — passar a ter desvio-padrão alto, e aí a região detectada engole a chamada inteira. Foi exatamente o que aconteceu na aula de 25/08. A diferença consecutiva cobra de cada célula a **frequência** com que ela muda, e esse evento único se dilui entre as 23 transições amostradas.
-
-Medido na aula de 25/08, nos parâmetros de produção: tela compartilhada ~106 níveis de mudança entre amostras, ladrilhos de participantes ~29, tarja preta ~22, pico ~147. O corte fica em 30% do pico (~44), que é o vão entre o primeiro valor e todos os outros.
-
-**A detecção precisa da gravação inteira.** Em um recorte de poucos minutos a separação se desfaz, porque a página fica parada e as webcams não. Quando a região detectada não concentra pelo menos 60% da mudança do frame, a detecção assume que travou em algo que se mexe *ao lado* da aula — a grade de ladrilhos, provavelmente — e mantém o frame inteiro.
-
-**A caixa é uma só por gravação, então ela é a união.** Se o professor mudar o layout da chamada no meio da aula — ladrilhos da lateral para o topo, painel de chat abrindo —, a região que carrega a aula ocupa posições diferentes ao longo do tempo, e a caixa cobre todas elas. O resultado fica grande, e está certo: apertar a caixa passaria a cortar conteúdo em parte da aula.
-
-O passo avisa quando o resultado cobre mais de 70% do frame, porque as duas situações acima produzem essa assinatura e pedem respostas opostas. Antes de forçar `--box`, olhe um frame do começo e um do fim. Em qualquer dos casos a falha é para o lado seguro: sobra moldura, nunca falta conteúdo.
-
-Medido nas aulas reais deste repositório: **80% a 83% menos disco**, sem perder legibilidade do código na tela.
-
-#### 4. Deduplicar por Perceptual Hash e Renomear pelo Offset
-Deduplica frames redundantes (pHash distance >= 6 ou intervalo >= 30s) e renomeia pelo timestamp da aula. Roda **depois** do recorte, de propósito: assim o hash compara conteúdo de aula, e não o relógio do Meet ou o ladrilho de quem mexeu na webcam.
-```bash
-uv run 04_dedupe_and_rename.py lectures/minha-aula/frames/cropped \
-  -o lectures/minha-aula/frames \
-  --offsets 00:04:37 \
-  --interval 5 \
-  --phash-threshold 6 \
-  --max-interval 30 \
-  --clean-raw
-```
-
----
-
-## 🤖 Workflow com o agente de IA
-
-Abra o agente multimodal (Antigravity, Claude, Codex, etc.) no diretório da aula:
+Um vídeo sozinho assume offset zero se a flag for omitida. Com dois ou mais, forneça **exatamente um offset por vídeo**:
 
 ```bash
-cd lectures/2026-08-25-algoritmos
+uv run digest.py parte-1.mov parte-2.mov --transcript transcript.txt \
+  --offsets 00:04:37 00:42:10 -o lectures/minha-aula
+
+uv run --extra audio digest.py parte-1.mp4 parte-2.mp4 --transcribe \
+  --offsets 00:00:00 00:42:10 -o lectures/minha-aula-com-audio
 ```
 
-E faça seus pedidos diretamente:
+São aceitos segundos inteiros, `MM:SS` ou `HH:MM:SS`, não negativos e em ordem cronológica. Não há inferência de intervalo entre gravações. No modo de áudio, segmentos que se sobrepõem são recusados para evitar fala duplicada ou fora de ordem; corrija os offsets ou forneça uma transcrição única. Com transcrição pronta, sobreposições visuais são permitidas e recebem nomes de frame sem colisão.
 
-> *"Read README.md and transcript.md. Study the lecture and inspect the relevant frames in frames/ when visual context is necessary."*
+Wispr pode manter uma timeline contínua com lacunas de pausa; os marcadores Paused/Resumed são preservados. Timestamps que voltam no tempo são recusados. Texto sem timestamps é colocado em `00:00:00` e não ganha alinhamento automático; para cruzar fala e frames, forneça texto timestampado. A precisão do pacote é de segundos, e os frames são amostras aproximadas.
 
-O destino da nota é `<vault>/raw/lectures`, não este diretório — ver `AGENTS.md`. Configure `<vault>` para o seu vault do Obsidian antes de usar o protocolo de estudo.
+## Recorte e tamanho do pacote
 
-> *"At 37:20 the professor discusses an edge case with 'essa linha aqui'. Explain what they mean, inspecting nearby frames."*
+O padrão extrai um frame a cada 5 segundos, detecta por gravação a região da tela compartilhada, reduz sua maior aresta a 1568 pixels e deduplica por pHash. O hash compara o conteúdo após o recorte. O primeiro frame é preservado, assim como mudanças de distância ≥ 6 ou intervalos ≥ 30 segundos.
 
-## Limites e intervenção humana
+A detecção foi ajustada para aulas em chamadas de vídeo: mede mudanças entre amostras consecutivas para separar a tela compartilhada da interface. Com poucas amostras, pouca mudança ou região implausível, mantém o frame inteiro. É uma heurística: inspecione frames do começo e do fim; mudar de layout durante a gravação pode prejudicar o recorte. Para vídeos gerais, use `--no-crop`.
 
-- O offset de cada `.mov` é informado manualmente. Um offset errado desalinha todos os frames daquele segmento.
-- A detecção de crop é heurística. Quando não confia no resultado, mantém o frame inteiro; inspecione um frame do início e outro do fim antes de aceitar o pacote.
-- A transcrição é a fonte verbal primária, mas pode conter erros de ASR. Nomes próprios e comandos devem ser conferidos contra os frames e o material da aula.
-- A preparação é local. O destino e a privacidade da inferência dependem do agente escolhido para abrir o pacote.
+```bash
+uv run digest.py demo.mp4 -t examples/wispr-transcript.txt \
+  --no-crop --max-edge 1280 --frame-quality 82 --interval 5 \
+  -o lectures/demo
+```
+
+Controles disponíveis em `uv run digest.py --help`:
+
+- `--crop-box left,top,right,bottom`: caixa explícita em pixels da gravação; substitui a detecção.
+- `--no-crop`: mantém o frame inteiro; incompatível com `--crop-box`.
+- `--max-edge 1568`: limite da maior aresta; `0` mantém a resolução. Não amplia imagens menores.
+- `--frame-quality 82`: qualidade JPEG final, de 1 a 95.
+- `--interval 5`: segundos entre amostras, maior que zero.
+- `--phash-threshold 6`: distância mínima de pHash, de 0 a 64.
+- `--max-interval 30`: tempo máximo entre amostras mantidas, limitado à grade de extração.
+- `--quality 2`: qualidade JPEG bruta do FFmpeg, de 1 a 31 (menor é melhor).
+- `--keep-raw`: preserva intermediários em `frames/raw/` e `frames/cropped/`; por padrão são removidos.
+
+## Saída e execução por agentes
+
+```text
+lectures/<data>-<topico>/
+├── README.md            # fontes, modo, alinhamento e instruções
+├── transcript.md        # cabeçalhos ## HH:MM:SS; ausente no modo só slides
+├── frames/              # opcional
+│   ├── index.csv        # timestamp,file
+│   └── HH-MM-SS.jpg
+└── materials/           # opcional
+    ├── README.md
+    ├── slides.pdf
+    ├── slides.pptx      # somente se a entrada foi PowerPoint
+    ├── slides.md
+    ├── slides-index.csv
+    ├── pages/           # imagens quando Poppler está disponível
+    └── slide-links.md   # após a transcrição
+```
+
+Para um agente preparar um pacote: identifique as fontes; escolha uma das flags verbais (`--transcript` **ou** `--transcribe`); acrescente `--slides` se houver material; informe os offsets; escolha `-o` explicitamente. `--transcript` e `--transcribe` são mutuamente exclusivos. Vídeos sem uma dessas flags são recusados. Flags de modelo e idioma exigem `--transcribe`.
+
+Diretórios com apenas slides podem ser finalizados ou ter o deck substituído. Um pacote com `transcript.md` ou `frames/` já existente não é sobrescrito: use outro diretório para recompilar. Entradas são lidas sem modificação; etapas de processamento usam área temporária e os arquivos gerados são copiados para o destino depois de concluídas. Erros de gravação na cópia final ainda podem deixar saída parcial.
+
+Para estudar, abra o agente no diretório do pacote e peça que leia `README.md`, `transcript.md` e os frames pertinentes. O protocolo de estudo em `AGENTS.md` continua valendo: o pacote é fonte, e o destino é `<vault>/raw/lectures` e `<vault>/wiki/`. Configure `<vault>` antes de estudar. O compilador não escreve no vault.
+
+## Migração para 0.2
+
+O projeto passa a se chamar **digest**. A interface muda para um único `digest.py`, sem wrappers dos comandos antigos:
+
+- `prepare_lecture.py videos -t texto --offsets ...` → `digest.py videos -t texto --offsets ...`.
+- `prepare_transcript.py texto.txt` → `digest.py --transcript texto.txt`.
+- `ingest_slides.py deck.pdf` → `digest.py --slides deck.pdf`.
+- Os quatro scripts numerados deixam de ser comandos independentes. Normalização fica em `transcript.py`; extração, recorte e deduplicação ficam em `frames.py`.
+
+Todos os modos exigem `-o`. O layout dos pacotes existentes e o diretório `lectures/` permanecem compatíveis com o protocolo de estudo. As instruções de compilação em `AGENTS.md` usam a interface atual. Neste ambiente, o projeto fica em `~/Developer/digest` e `~/Learning/lectures` aponta para `~/Developer/digest/lectures`. Atualize invocações externas dos scripts removidos conforme os exemplos acima.
 
 ## Privacidade
 
-`lectures/` é ignorado pelo Git porque pode conter falas, nomes, avatares, chats, códigos de reunião, materiais do professor e trabalhos de alunos. Não publique um pacote real, mesmo quando o crop parece ter removido a interface da chamada: o fallback deliberadamente preserva o frame inteiro.
+`lectures/` e extensões comuns de mídia são ignorados pelo Git porque as fontes podem conter falas, nomes, avatares, chats e material de terceiros. Outros diretórios de saída precisam de cuidado próprio. Revise qualquer pacote antes de compartilhar; o recorte pode manter o frame inteiro. A privacidade ao estudar depende também do agente que abrir o pacote.
 
-Use somente dados fictícios em demonstrações públicas. [`examples/wispr-transcript.txt`](examples/wispr-transcript.txt) é uma entrada mínima sanitizada; ela pode ser combinada com uma gravação `.mov` criada por você.
+Use o texto fictício em [`examples/wispr-transcript.txt`](examples/wispr-transcript.txt) para demonstrações, junto de vídeos criados por você.
 
-## 🧪 Testes
+## Desenvolvimento e verificação
 
-Execute a suíte completa. O teste end-to-end gera uma gravação `.mov` sintética com FFmpeg e verifica o pacote resultante:
+São quatro arquivos de implementação: `digest.py` coordena CLI e pacote; `transcript.py` normaliza texto e transcreve áudio; `frames.py` processa imagens; `slide_materials.py` ingere decks e associa páginas.
+
 ```bash
-uv run python3 -m unittest discover tests
+uv run python -m unittest discover tests
 ```
+
+A suíte gera vídeos sintéticos com FFmpeg e valida modos, offsets, extração real de áudio, atraso de trilha, frames, recorte, slides e falhas sem publicação. O reconhecedor é substituído nos testes determinísticos; eles não baixam modelos nem medem qualidade de ASR. Valide reconhecimento real com um vídeo de fala conhecido e `--transcribe --model tiny --language en` (ou o idioma correspondente).

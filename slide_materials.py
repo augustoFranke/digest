@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""PDF slide ingestion and conservative transcript-to-page linking."""
+"""Slide ingestion (PDF or .pptx) and conservative transcript-to-page linking."""
 
 import csv
 import re
 import shutil
 import subprocess
-import sys
+import tempfile
 from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
@@ -25,11 +25,16 @@ class SlidePage:
 
 WORD_PATTERN = re.compile(r"[^\W\d_]{3,}", re.UNICODE)
 STOPWORDS = frozenset(
-    "a ao aos as de da das do dos e em na nas no nos o os para por que se um uma "
-    "uns umas com como mais menos muito muita este esta esse essa isso aqui ali "
-    "sobre entre pelo pela pelos pelas quando onde então também já não sim são "
-    "ser foi tem temos vai vamos sua suas seu seus".split()
+    ["a", "ao", "aos", "as", "de", "da", "das", "do", "dos", "e", "em", "na", "nas", "no", "nos", "o", "os", "para", "por", "que", "se", "um", "uma", "uns", "umas", "com", "como", "mais", "menos", "muito", "muita", "este", "esta", "esse", "essa", "isso", "aqui", "ali", "sobre", "entre", "pelo", "pela", "pelos", "pelas", "quando", "onde", "então", "também", "já", "não", "sim", "são", "ser", "foi", "tem", "temos", "vai", "vamos", "sua", "suas", "seu", "seus"]
 )
+
+
+PDF_SUFFIX = ".pdf"
+PPTX_SUFFIX = ".pptx"
+SUPPORTED_SLIDE_SUFFIXES = (PDF_SUFFIX, PPTX_SUFFIX)
+MACOS_SOFFICE = Path("/Applications/LibreOffice.app/Contents/MacOS/soffice")
+# A deck that stalls the converter never returns; the wait has to end somewhere.
+CONVERSION_TIMEOUT_SECONDS = 300
 
 
 def _require_pdf_reader() -> None:
@@ -90,6 +95,55 @@ def render_slide_pages(pdf_path: Path, pages_dir: Path) -> list[Path]:
     return rendered
 
 
+def _find_soffice() -> str | None:
+    """Finds LibreOffice, including the macOS bundle that installs no PATH entry."""
+    found = shutil.which("soffice") or shutil.which("libreoffice")
+    if found:
+        return found
+    return str(MACOS_SOFFICE) if MACOS_SOFFICE.is_file() else None
+
+
+def convert_pptx_to_pdf(pptx_path: Path, staging_dir: Path) -> Path:
+    """Converts a deck to PDF, because every later step reads pages, never shapes."""
+    soffice = _find_soffice()
+    if soffice is None:
+        raise ValueError(
+            f"LibreOffice is required to ingest '{pptx_path.name}'. "
+            "Install it (`brew install --cask libreoffice`) or export the deck to PDF first."
+        )
+
+    try:
+        subprocess.run(
+            [
+                soffice,
+                # A private profile: the default one is locked while the desktop app runs.
+                f"-env:UserInstallation=file://{staging_dir / 'libreoffice-profile'}",
+                "--headless",
+                "--convert-to",
+                "pdf",
+                "--outdir",
+                str(staging_dir),
+                str(pptx_path),
+            ],
+            check=True,
+            capture_output=True,
+            timeout=CONVERSION_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise ValueError(
+            f"LibreOffice did not finish converting '{pptx_path.name}' within "
+            f"{CONVERSION_TIMEOUT_SECONDS}s; convert the deck by hand and ingest the PDF."
+        ) from exc
+    except subprocess.CalledProcessError as exc:
+        detail = exc.stderr.decode(errors="replace").strip()
+        raise ValueError(f"LibreOffice could not convert '{pptx_path}': {detail}") from exc
+
+    converted = staging_dir / f"{pptx_path.stem}{PDF_SUFFIX}"
+    if not converted.is_file():
+        raise ValueError(f"LibreOffice reported success but produced no PDF for '{pptx_path}'.")
+    return converted
+
+
 def _write_slide_index(path: Path, pages: Iterable[SlidePage], rendered_pages: list[Path]) -> None:
     with path.open("w", newline="", encoding="utf-8") as index_file:
         writer = csv.writer(index_file)
@@ -100,15 +154,20 @@ def _write_slide_index(path: Path, pages: Iterable[SlidePage], rendered_pages: l
         )
 
 
-def _materials_readme(page_count: int, source_name: str, rendered_pages: int) -> str:
+def _materials_readme(page_count: int, source_name: str, rendered_pages: int, converted: bool = False) -> str:
+    origin = (
+        f"Fonte preservada: `{source_name}` → `slides.pptx`, convertida pelo LibreOffice para `slides.pdf`."
+        if converted
+        else f"Fonte preservada: `{source_name}` → `slides.pdf`."
+    )
     return f"""# Material de slides
 
-Fonte preservada: `{source_name}` → `slides.pdf`.
+{origin}
 Páginas: {page_count}. Imagens renderizadas: {rendered_pages}.
 
 `slides.md` contém o texto extraído por página, `pages/page-NNN.jpg` preserva a camada visual e `slides-index.csv` permite localizar rapidamente cada página.
 
-O texto extraído serve para busca e associação com a transcrição. Ele não substitui a página visual: tabelas, diagramas e fórmulas devem ser conferidos no PDF original.
+O texto extraído serve para busca e associação com a transcrição. Ele não substitui a página visual: tabelas, diagramas e fórmulas devem ser conferidos no arquivo original.
 """
 
 
@@ -116,33 +175,45 @@ def _pending_package_readme(output_dir: Path) -> str:
     """Describes a package that currently contains materials but no transcript."""
     return f"""# Lecture Context: {output_dir.name}
 
-This package currently contains the professor's slide material only. Add the Wispr `.txt`
-transcript later by running `prepare_lecture.py` with the recording, or
-`prepare_transcript.py` when the class has no screen recording, against this same directory.
+This package currently contains the professor's slide material only. Add text later
+with `digest.py --transcript transcript.txt -o <this-directory>`, optionally supplying
+videos and their `--offsets`. For video with audio, use
+`digest.py recording.mp4 --transcribe -o <this-directory>`.
 
 Read `materials/README.md` and `materials/slides.md` to inspect the page-indexed deck.
 """
 
 
-def ingest_slides(pdf_path: Path, output_dir: Path) -> int:
-    """Copies a slide PDF and creates a page-indexed material bundle."""
-    if not pdf_path.is_file():
-        raise FileNotFoundError(f"Slide PDF not found: {pdf_path}")
-    if pdf_path.suffix.lower() != ".pdf":
-        raise ValueError(f"Slide material must be a .pdf file: {pdf_path}")
+def ingest_slides(source_path: Path, output_dir: Path) -> int:
+    """Preserves a slide deck (.pdf or .pptx) and creates a page-indexed bundle."""
+    if not source_path.is_file():
+        raise FileNotFoundError(f"Slide material not found: {source_path}")
+    suffix = source_path.suffix.lower()
+    if suffix not in SUPPORTED_SLIDE_SUFFIXES:
+        raise ValueError(f"Slide material must be a .pdf or .pptx file: {source_path}")
 
-    pages = extract_slide_pages(pdf_path)
     materials_dir = output_dir / "materials"
-    materials_dir.mkdir(parents=True, exist_ok=True)
     destination = materials_dir / "slides.pdf"
-    if pdf_path.resolve() != destination.resolve():
-        shutil.copy2(pdf_path, destination)
+    converted = suffix == PPTX_SUFFIX
+    # Conversion and text extraction run before any output exists, so a deck that
+    # cannot be read leaves no half-written package behind.
+    with tempfile.TemporaryDirectory(prefix="digest_pptx_") as staging:
+        pdf_path = convert_pptx_to_pdf(source_path, Path(staging)) if converted else source_path
+        pages = extract_slide_pages(pdf_path)
+        materials_dir.mkdir(parents=True, exist_ok=True)
+        if converted:
+            shutil.copy2(source_path, materials_dir / "slides.pptx")
+        else:
+            # A deck from an earlier ingestion would keep claiming to be this package's source.
+            (materials_dir / "slides.pptx").unlink(missing_ok=True)
+        if pdf_path.resolve() != destination.resolve():
+            shutil.copy2(pdf_path, destination)
 
     rendered_pages = render_slide_pages(destination, materials_dir / "pages")
     (materials_dir / "slides.md").write_text(_render_slide_markdown(pages), encoding="utf-8")
     _write_slide_index(materials_dir / "slides-index.csv", pages, rendered_pages)
     (materials_dir / "README.md").write_text(
-        _materials_readme(len(pages), pdf_path.name, len(rendered_pages)), encoding="utf-8"
+        _materials_readme(len(pages), source_path.name, len(rendered_pages), converted), encoding="utf-8"
     )
     package_readme = output_dir / "README.md"
     if not package_readme.exists():
@@ -218,23 +289,3 @@ def write_slide_links(output_dir: Path, entries: Iterable[dict[str, Any]]) -> in
     links = link_transcript_to_slides(entries, pages)
     (output_dir / "materials" / "slide-links.md").write_text(render_slide_links(links), encoding="utf-8")
     return len(links)
-
-
-def main() -> None:
-    import argparse
-
-    parser = argparse.ArgumentParser(description="Ingest a slide PDF before the lecture transcript is available.")
-    parser.add_argument("pdf", help="Path to the slide PDF")
-    parser.add_argument("-o", "--output-dir", default="lectures/lecture", help="Lecture package directory")
-    args = parser.parse_args()
-
-    try:
-        pages = ingest_slides(Path(args.pdf), Path(args.output_dir))
-        print(f"Ingested {pages} slide page(s) into {Path(args.output_dir) / 'materials'}")
-    except Exception as exc:
-        print(f"Error: {exc}", file=sys.stderr)
-        raise SystemExit(1) from exc
-
-
-if __name__ == "__main__":
-    main()

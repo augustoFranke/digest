@@ -1,9 +1,32 @@
-# Lecture Digest — Study Protocol
+# Digest — Study Protocol
 
 This repo compiles lecture recordings into agent-ready packages.
 When the user is studying a lecture, **the vault note is the product**. Chat is only a receipt.
 
-Questions about this repo's code, pipeline, or tooling are normal engineering work — answer those in chat. Everything below applies to lecture study.
+Questions about this repo's code, pipeline, or tooling are normal engineering work — answer those in chat. The study protocol starts at Destination, after the compiler reference below.
+
+## Compile sources with Digest 0.2
+
+The compiler is `~/Developer/digest/digest.py`. Run from `~/Developer/digest`
+and choose the input mode with flags; all modes require an explicit `-o`:
+
+- Existing timestamped text, with optional video: `uv run digest.py [recording.mov ...] --transcript transcript.txt -o lectures/<date>-<slug>`.
+- Video with audio: `uv run --extra audio digest.py recording.mp4 --transcribe -o lectures/<date>-<slug>`.
+- Slides alone or alongside either mode: add `--slides slides.pdf` or `--slides slides.pptx`.
+- Video without extracted frames: add `--no-frames` to produce a transcript-only package.
+
+`--transcript` and `--transcribe` are mutually exclusive. For existing text,
+any video audio is ignored. Local ASR defaults to `--model small --language pt`;
+the audio extra and model download are needed only for `--transcribe`.
+A single video defaults to offset zero. Multiple videos require exactly one
+`--offsets` start per recording, in chronological order. These starts apply to
+both frames and recognized speech; audio recordings must not overlap.
+
+A slides-only directory can be finalized later using the same `-o`. A directory
+already containing `transcript.md` or `frames/` is not overwritten; choose a new
+output directory to recompile. The old separate and numbered scripts were
+removed. Read `README.md` for installation, complete examples and limitations.
+Compilation does not write study notes; the study protocol below applies afterward.
 
 ## Destination
 
@@ -39,7 +62,7 @@ lectures/<date>-<slug>/
 
 The package is read-only source. Nothing is written back into it — the vault is the sink.
 
-Read `README.md` and `transcript.md` before writing. When frames exist and the professor says "isso aqui", "essa linha", "como vocês podem ver", open the nearest preceding frame. When `materials/` exists, use `slide-links.md` only as a page candidate list and verify the page in `slides.pdf`; a lexical candidate is not proof of what was shown at that second. Transcript is the verbal source; frames and slides recover visual context. A transcript-only package is valid when the class had no screen recording; build it with `prepare_transcript.py`.
+Read `README.md` and `transcript.md` before writing. When frames exist and the professor says "isso aqui", "essa linha", "como vocês podem ver", open the nearest preceding frame. When `materials/` exists, use `slide-links.md` only as a page candidate list and verify the page in `slides.pdf`; a lexical candidate is not proof of what was shown at that second. Transcript is the verbal source; frames and slides recover visual context. A transcript-only package is valid when the class had no screen recording; build it with `uv run digest.py --transcript transcript.txt -o lectures/<date>-<slug>`.
 
 ## Then write (or open) the note — before answering
 

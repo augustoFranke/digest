@@ -1,6 +1,5 @@
-#!/usr/bin/env python3
 """
-Unit and integration tests for the lecture-digest pipeline.
+Unit and integration tests for the digest pipeline.
 """
 
 import shutil
@@ -8,26 +7,29 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
-from importlib.machinery import SourceFileLoader
 from unittest.mock import patch
 
 import numpy as np
 from PIL import Image
 
-# Load modules dynamically
-root_dir = Path(__file__).parent.parent.resolve()
-norm_mod = SourceFileLoader("norm_mod", str(root_dir / "01_normalize_transcript.py")).load_module()
-extract_mod = SourceFileLoader("extract_mod", str(root_dir / "02_extract_frames.py")).load_module()
-crop_mod = SourceFileLoader("crop_mod", str(root_dir / "03_crop_frames.py")).load_module()
-dedupe_mod = SourceFileLoader("dedupe_mod", str(root_dir / "04_dedupe_and_rename.py")).load_module()
-prepare_mod = SourceFileLoader("prepare_mod", str(root_dir / "prepare_lecture.py")).load_module()
-slides_mod = SourceFileLoader("slides_mod", str(root_dir / "slide_materials.py")).load_module()
-transcript_prepare_mod = SourceFileLoader("transcript_prepare_mod", str(root_dir / "prepare_transcript.py")).load_module()
+import digest as prepare_mod
+import frames as crop_mod
+import frames as dedupe_mod
+import slide_materials as slides_mod
+import transcript as norm_mod
+
+
+def compile_args(*arguments):
+    return prepare_mod.build_parser().parse_args([str(a) for a in arguments])
+
+
+def compile_text(path, output, title=""):
+    prepare_mod.compile_package(compile_args("-t", path, "-o", output, "--title", title))
 
 
 class TestSlideMaterials(unittest.TestCase):
     def setUp(self):
-        self.temp_dir = Path(tempfile.mkdtemp(prefix="lecture_digest_slides_"))
+        self.temp_dir = Path(tempfile.mkdtemp(prefix="digest_slides_"))
         self.source_pdf = self.temp_dir / "professor-slides.pdf"
         self.source_pdf.write_bytes(b"placeholder PDF used by the ingestion contract test")
 
@@ -51,7 +53,7 @@ class TestSlideMaterials(unittest.TestCase):
         self.assertIn("## Página 1", (materials / "slides.md").read_text(encoding="utf-8"))
         self.assertIn("2,", (materials / "slides-index.csv").read_text(encoding="utf-8"))
         self.assertIn("slides.pdf", (materials / "README.md").read_text(encoding="utf-8"))
-        self.assertIn("prepare_transcript.py", (self.temp_dir / "lecture" / "README.md").read_text(encoding="utf-8"))
+        self.assertIn("digest.py --transcript", (self.temp_dir / "lecture" / "README.md").read_text(encoding="utf-8"))
 
     def test_links_transcript_sections_to_page_candidates(self):
         pages = [
@@ -68,12 +70,101 @@ class TestSlideMaterials(unittest.TestCase):
         self.assertIn("confiança", rendered)
         self.assertIn("não prova", rendered)
 
-    def test_rejects_non_pdf_slide_material(self):
-        text_file = self.temp_dir / "slides.pptx"
-        text_file.touch()
+    LIBREOFFICE_SHIM = (
+        'outdir=""\n'
+        'while [ $# -gt 0 ]; do\n'
+        '  case "$1" in --outdir) outdir="$2"; shift 2;; *) last="$1"; shift;; esac\n'
+        'done\n'
+        'printf "converted PDF" > "$outdir/$(basename "$last" .pptx).pdf"'
+    )
 
-        with self.assertRaisesRegex(ValueError, r"\.pdf"):
-            slides_mod.ingest_slides(text_file, self.temp_dir / "lecture")
+    def _fake_soffice(self, body: str):
+        """Stands in for LibreOffice so the conversion wiring is exercised for real."""
+        script = self.temp_dir / "fake-soffice"
+        script.write_text(f"#!/bin/sh\n{body}\n", encoding="utf-8")
+        script.chmod(0o755)
+        return patch.object(slides_mod, "_find_soffice", return_value=str(script))
+
+    def _source_pptx(self) -> Path:
+        deck = self.temp_dir / "professor-slides.pptx"
+        deck.write_bytes(b"placeholder PPTX used by the conversion contract test")
+        return deck
+
+    def test_ingests_pptx_by_converting_to_pdf(self):
+        deck = self._source_pptx()
+        pages = [slides_mod.SlidePage(1, "Gerência de configuração e baseline")]
+
+        with self._fake_soffice(self.LIBREOFFICE_SHIM), patch.object(
+            slides_mod, "extract_slide_pages", return_value=pages
+        ), patch.object(slides_mod, "render_slide_pages", return_value=[]):
+            count = slides_mod.ingest_slides(deck, self.temp_dir / "lecture")
+
+        materials = self.temp_dir / "lecture" / "materials"
+        readme = (materials / "README.md").read_text(encoding="utf-8")
+        self.assertEqual(count, 1)
+        self.assertEqual((materials / "slides.pdf").read_bytes(), b"converted PDF")
+        self.assertEqual((materials / "slides.pptx").read_bytes(), deck.read_bytes())
+        self.assertIn("professor-slides.pptx", readme)
+        self.assertIn("LibreOffice", readme)
+        self.assertIn("## Página 1", (materials / "slides.md").read_text(encoding="utf-8"))
+
+    def test_reingesting_a_pdf_drops_the_previous_pptx_source(self):
+        materials = self.temp_dir / "lecture" / "materials"
+        materials.mkdir(parents=True)
+        (materials / "slides.pptx").write_bytes(b"deck from an earlier ingestion")
+        pages = [slides_mod.SlidePage(1, "Baseline")]
+
+        with patch.object(slides_mod, "extract_slide_pages", return_value=pages), patch.object(
+            slides_mod, "render_slide_pages", return_value=[]
+        ):
+            slides_mod.ingest_slides(self.source_pdf, self.temp_dir / "lecture")
+
+        self.assertFalse((materials / "slides.pptx").exists())
+
+    def test_rejects_unsupported_slide_material(self):
+        keynote = self.temp_dir / "slides.key"
+        keynote.touch()
+
+        with self.assertRaisesRegex(ValueError, r"\.pptx"):
+            slides_mod.ingest_slides(keynote, self.temp_dir / "lecture")
+
+    def test_reports_missing_libreoffice_without_writing_a_package(self):
+        deck = self._source_pptx()
+
+        with patch.object(slides_mod, "_find_soffice", return_value=None), self.assertRaisesRegex(
+            ValueError, "LibreOffice is required"
+        ):
+            slides_mod.ingest_slides(deck, self.temp_dir / "lecture")
+
+        self.assertFalse((self.temp_dir / "lecture" / "materials").exists())
+
+    def test_failed_conversion_leaves_no_package(self):
+        deck = self._source_pptx()
+
+        with self._fake_soffice('echo "source file could not be loaded" >&2\nexit 1'), self.assertRaisesRegex(
+            ValueError, "could not be loaded"
+        ):
+            slides_mod.ingest_slides(deck, self.temp_dir / "lecture")
+
+        self.assertFalse((self.temp_dir / "lecture" / "materials").exists())
+
+    def test_silent_conversion_without_output_is_an_error(self):
+        deck = self._source_pptx()
+
+        with self._fake_soffice("exit 0"), self.assertRaisesRegex(ValueError, "no PDF"):
+            slides_mod.ingest_slides(deck, self.temp_dir / "lecture")
+
+        self.assertFalse((self.temp_dir / "lecture" / "materials").exists())
+
+    def test_stalled_conversion_times_out(self):
+        deck = self._source_pptx()
+
+        with self._fake_soffice("sleep 5"), patch.object(
+            slides_mod, "CONVERSION_TIMEOUT_SECONDS", 1
+        ), self.assertRaisesRegex(ValueError, "did not finish converting"):
+            slides_mod.ingest_slides(deck, self.temp_dir / "lecture")
+
+        self.assertFalse((self.temp_dir / "lecture" / "materials").exists())
 
     def test_compiled_readme_mentions_ingested_slides(self):
         readme = prepare_mod.generate_readme(
@@ -91,7 +182,7 @@ class TestSlideMaterials(unittest.TestCase):
 
 class TestTranscriptOnlyPackage(unittest.TestCase):
     def setUp(self):
-        self.temp_dir = Path(tempfile.mkdtemp(prefix="lecture_digest_transcript_only_"))
+        self.temp_dir = Path(tempfile.mkdtemp(prefix="digest_transcript_only_"))
         self.transcript = self.temp_dir / "transcript.txt"
         self.transcript.write_text("[00:00] Gerência de configuração e baseline.", encoding="utf-8")
 
@@ -101,9 +192,8 @@ class TestTranscriptOnlyPackage(unittest.TestCase):
     def test_prepares_without_recording(self):
         output = self.temp_dir / "lecture"
 
-        links = transcript_prepare_mod.prepare_transcript(self.transcript, output, "Aula sem gravação")
+        compile_text(self.transcript, output, "Aula sem gravação")
 
-        self.assertEqual(links, 0)
         self.assertTrue((output / "transcript.md").is_file())
         self.assertTrue((output / "README.md").is_file())
         self.assertFalse((output / "frames").exists())
@@ -114,15 +204,12 @@ class TestTranscriptOnlyPackage(unittest.TestCase):
         (output / "materials").mkdir(parents=True)
         (output / "materials" / "slides.pdf").write_bytes(b"placeholder PDF")
 
-        with patch.object(
-            transcript_prepare_mod.slide_materials,
-            "write_slide_links",
-            return_value=1,
-        ) as write_links:
-            links = transcript_prepare_mod.prepare_transcript(self.transcript, output)
+        with patch.object(slides_mod, "extract_slide_pages", return_value=[
+            slides_mod.SlidePage(1, "Gerência de configuração e baseline")
+        ]):
+            compile_text(self.transcript, output)
 
-        self.assertEqual(links, 1)
-        write_links.assert_called_once()
+        self.assertTrue((output / "materials" / "slide-links.md").is_file())
         readme = (output / "README.md").read_text(encoding="utf-8")
         self.assertIn("materials/slides.pdf", readme)
 
@@ -185,7 +272,7 @@ We can see the algorithm complexity is O(N).
 
 class TestInputContract(unittest.TestCase):
     def setUp(self):
-        self.temp_dir = Path(tempfile.mkdtemp(prefix="lecture_digest_inputs_"))
+        self.temp_dir = Path(tempfile.mkdtemp(prefix="digest_inputs_"))
         self.recording = self.temp_dir / "recording.mov"
         self.transcript = self.temp_dir / "transcript.txt"
         self.recording.touch()
@@ -194,53 +281,26 @@ class TestInputContract(unittest.TestCase):
     def tearDown(self):
         shutil.rmtree(self.temp_dir, ignore_errors=True)
 
-    def test_accepts_mov_txt_and_one_offset_per_recording(self):
-        prepare_mod.validate_inputs([self.recording], self.transcript, ["00:00:00"])
-
-    def test_rejects_non_mov_recording(self):
-        recording = self.temp_dir / "recording.mp4"
-        recording.touch()
-
-        with self.assertRaisesRegex(ValueError, r"\.mov"):
-            prepare_mod.validate_inputs([recording], self.transcript, ["00:00:00"])
-
     def test_rejects_non_txt_transcript(self):
-        transcript = self.temp_dir / "transcript.srt"
-        transcript.touch()
-
+        source = self.temp_dir / "transcript.srt"
+        source.touch()
         with self.assertRaisesRegex(ValueError, r"\.txt"):
-            prepare_mod.validate_inputs([self.recording], transcript, ["00:00:00"])
+            compile_text(source, self.temp_dir / "output")
 
     def test_rejects_missing_offset_before_creating_output(self):
-        second_recording = self.temp_dir / "recording-2.mov"
-        second_recording.touch()
+        second = self.temp_dir / "recording-2.mov"
+        second.touch()
         output = self.temp_dir / "output"
-
         with self.assertRaisesRegex(ValueError, "one --offsets value per recording"):
-            prepare_mod.prepare_lecture(
-                video_paths=[self.recording, second_recording],
-                transcript_path=self.transcript,
-                output_dir=output,
-                offsets=["00:00:00"],
-            )
-
+            prepare_mod.compile_package(compile_args(self.recording, second, "-t", self.transcript,
+                                                     "--offsets", "0", "-o", output))
         self.assertFalse(output.exists())
 
     def test_rejects_wispr_timestamp_reset_before_creating_output(self):
-        self.transcript.write_text(
-            "[00:10:00] First segment.\n[00:00:00] Restarted segment.",
-            encoding="utf-8",
-        )
+        self.transcript.write_text("[00:10:00] First.\n[00:00:00] Restarted.", encoding="utf-8")
         output = self.temp_dir / "output"
-
         with self.assertRaisesRegex(ValueError, "timestamps go backwards"):
-            prepare_mod.prepare_lecture(
-                video_paths=[self.recording],
-                transcript_path=self.transcript,
-                output_dir=output,
-                offsets=["00:00:00"],
-            )
-
+            compile_text(self.transcript, output)
         self.assertFalse(output.exists())
 
 
@@ -294,7 +354,7 @@ def write_synthetic_frames(directory, count, content_box, size=(800, 600), prefi
 
 class TestFrameCropping(unittest.TestCase):
     def setUp(self):
-        self.temp_dir = Path(tempfile.mkdtemp(prefix="lecture_digest_crop_"))
+        self.temp_dir = Path(tempfile.mkdtemp(prefix="digest_crop_"))
 
     def tearDown(self):
         shutil.rmtree(self.temp_dir, ignore_errors=True)
@@ -479,7 +539,7 @@ class TestFrameCropping(unittest.TestCase):
 class TestEndToEndPipeline(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.temp_dir = Path(tempfile.mkdtemp(prefix="lecture_digest_test_"))
+        cls.temp_dir = Path(tempfile.mkdtemp(prefix="digest_test_"))
         cls.video_path = cls.temp_dir / "recording.mov"
         cls.transcript_path = cls.temp_dir / "transcript.txt"
 
@@ -491,7 +551,7 @@ class TestEndToEndPipeline(unittest.TestCase):
             "-pix_fmt", "yuv420p",
             str(cls.video_path)
         ]
-        res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        res = subprocess.run(cmd, capture_output=True, check=False)
         if res.returncode != 0:
             raise RuntimeError(f"FFmpeg test video generation failed: {res.stderr.decode()}")
 
@@ -516,21 +576,13 @@ class TestEndToEndPipeline(unittest.TestCase):
         (materials_dir / "slides.pdf").write_bytes(b"placeholder PDF supplied by the earlier ingestion step")
 
         # Run prepare_lecture with offset 04:37 (277 seconds)
-        fake_pages = [prepare_mod.slide_mod.SlidePage(1, "Algorithms complexity chart")]
-        with patch.object(prepare_mod.slide_mod, "extract_slide_pages", return_value=fake_pages):
-            prepare_mod.prepare_lecture(
-                video_paths=[self.video_path],
-                transcript_path=self.transcript_path,
-                output_dir=out_lecture_dir,
-                offsets=["00:04:37"],
-                interval_seconds=5.0,
-                phash_threshold=6,
-                max_interval_seconds=30.0,
-                quality=2,
-                max_edge=320,
-                keep_raw=False,
-                title="Algorithms Lecture 01"
-            )
+        fake_pages = [slides_mod.SlidePage(1, "Algorithms complexity chart")]
+        with patch.object(slides_mod, "extract_slide_pages", return_value=fake_pages):
+            prepare_mod.compile_package(compile_args(
+                self.video_path, "-t", self.transcript_path, "-o", out_lecture_dir,
+                "--offsets", "00:04:37", "--max-edge", "320",
+                "--title", "Algorithms Lecture 01",
+            ))
 
         # Check deliverables
         self.assertTrue((out_lecture_dir / "README.md").is_file())

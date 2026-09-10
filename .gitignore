@@ -15,8 +15,18 @@ lectures/
 
 # Raw classroom captures and professor materials. Only the fictional fixture under examples/ is public.
 *.mov
+*.mp4
+*.mkv
+*.webm
+*.avi
+*.m4v
+*.wav
+*.mp3
+*.m4a
+*.pptx
 *.txt
 *.pdf
 !examples/*.txt
 
 .DS_Store
+.ruff_cache/

@@ -1,7 +1,7 @@
 [project]
-name = "lecture-digest"
-version = "0.1.0"
-description = "Compile Wispr transcripts, screen recordings, and slide PDFs into study context"
+name = "digest"
+version = "0.2.0"
+description = "Compile transcripts, videos with audio, and slide decks into study context"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
@@ -10,3 +10,6 @@ dependencies = [
     "pillow>=12.3.0",
     "pypdf>=5.0.0",
 ]
+
+[project.optional-dependencies]
+audio = ["faster-whisper>=1.2.1,<2"]

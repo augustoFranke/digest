@@ -1,28 +1,11 @@
-#!/usr/bin/env python3
-"""
-01_normalize_transcript.py
+"""Timestamped text normalization and optional local speech recognition."""
 
-Normalizes the timestamped plain-text export produced by Wispr Flow into a clean,
-standardized Markdown file (transcript.md) with searchable timestamp headers.
-
-Example output:
-    # Transcript
-
-    ## 00:00:00
-    Welcome everyone to today's lecture.
-
-    ## 00:04:37
-    Let's begin looking at the architecture diagram.
-"""
-
-import argparse
 import re
-import sys
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 
-def parse_timestamp_to_seconds(ts_str: str) -> Optional[int]:
+def parse_timestamp_to_seconds(ts_str: str) -> int | None:
     """
     Parses timestamp strings like:
       - '04:37' -> 277
@@ -31,11 +14,11 @@ def parse_timestamp_to_seconds(ts_str: str) -> Optional[int]:
       - '00:04:37,500' -> 277
       - '00:04:37.500' -> 277
     """
-    ts_str = ts_str.strip().replace(',', '.')
-    if '.' in ts_str:
-        ts_str = ts_str.split('.')[0]
+    ts_str = ts_str.strip().replace(",", ".")
+    if "." in ts_str:
+        ts_str = ts_str.split(".")[0]
 
-    parts = ts_str.split(':')
+    parts = ts_str.split(":")
     try:
         parts = [int(p) for p in parts]
         if len(parts) == 3:
@@ -64,14 +47,14 @@ def format_seconds_to_timestamp(seconds: int, always_hours: bool = True) -> str:
 
 
 TIMESTAMP_TOKEN = re.compile(
-    r'(\[\d{1,2}:\d{2}\s*(?:AM|PM)\]\s*--\s*(?:Paused|Resumed)\s*--(?:\s*\[\d{1,2}:\d{2}\s*(?:AM|PM)\]\s*--\s*(?:Paused|Resumed)\s*--)*|'
-    r'\[(\d{1,2}:\d{2}(?::\d{2})?)\]|'
-    r'(?:^|[\n\r])\s*(?:##\s*)?(\d{1,2}:\d{2}(?::\d{2})?)\b[\s\-:]*)',
+    r"(\[\d{1,2}:\d{2}\s*(?:AM|PM)\]\s*--\s*(?:Paused|Resumed)\s*--(?:\s*\[\d{1,2}:\d{2}\s*(?:AM|PM)\]\s*--\s*(?:Paused|Resumed)\s*--)*|"
+    r"\[(\d{1,2}:\d{2}(?::\d{2})?)\]|"
+    r"(?:^|[\n\r])\s*(?:##\s*)?(\d{1,2}:\d{2}(?::\d{2})?)\b[\s\-:]*)",
     re.MULTILINE,
 )
 
 
-def _append_text(token: Dict[str, Any], text: str) -> None:
+def _append_text(token: dict[str, Any], text: str) -> None:
     """Adds non-empty transcript text to a timestamp or pause marker."""
     text = text.strip()
     if not text:
@@ -79,7 +62,7 @@ def _append_text(token: Dict[str, Any], text: str) -> None:
     token["text"] = f"{token.get('text', '')} {text}".strip()
 
 
-def _token_from_match(match: re.Match[str]) -> Dict[str, Any]:
+def _token_from_match(match: re.Match[str]) -> dict[str, Any]:
     """Converts one Wispr timestamp or pause marker into a transcript token."""
     matched_text = match.group(0).strip()
     timestamp = match.group(2) or match.group(3)
@@ -92,23 +75,25 @@ def _token_from_match(match: re.Match[str]) -> Dict[str, Any]:
     return {"type": "timestamp", "sec": seconds, "raw_ts": timestamp, "text": ""}
 
 
-def _preamble_and_start(content: str) -> tuple[List[Dict[str, Any]], int]:
+def _preamble_and_start(content: str) -> tuple[list[dict[str, Any]], int]:
     """Returns an optional preamble and the point where timestamp parsing begins."""
     first_match = TIMESTAMP_TOKEN.search(content)
     if first_match is None:
         return [], 0
-    preamble = content[:first_match.start()].strip()
+    preamble = content[: first_match.start()].strip()
     tokens = [{"type": "preamble", "text": preamble}] if preamble else []
     return tokens, first_match.start()
 
 
-def _append_preceding_text(tokens: List[Dict[str, Any]], content: str, start: int, end: int) -> None:
+def _append_preceding_text(
+    tokens: list[dict[str, Any]], content: str, start: int, end: int
+) -> None:
     """Assigns text between timestamp tokens to the preceding transcript token."""
     if tokens and tokens[-1].get("type") in ("timestamp", "marker"):
         _append_text(tokens[-1], content[start:end])
 
 
-def parse_inline_and_text(content: str) -> List[Dict[str, Any]]:
+def parse_inline_and_text(content: str) -> list[dict[str, Any]]:
     """
     Parses timestamped text formats, including multi-line or inline timestamps
     (e.g., [04:37] Speaker: ..., 04:37 - Speaker, ## 04:37) and pause/resume markers.
@@ -128,7 +113,7 @@ def parse_inline_and_text(content: str) -> List[Dict[str, Any]]:
     return [{"type": "timestamp", "sec": 0, "text": content.strip()}]
 
 
-def normalize_transcript(content: str) -> List[Dict[str, Any]]:
+def normalize_transcript(content: str) -> list[dict[str, Any]]:
     """Parses a Wispr plain-text export into timestamped entries."""
     stripped = content.strip()
     if not stripped:
@@ -150,7 +135,7 @@ def normalize_transcript(content: str) -> List[Dict[str, Any]]:
     return entries
 
 
-def generate_markdown(entries: List[Dict[str, Any]]) -> str:
+def generate_markdown(entries: list[dict[str, Any]]) -> str:
     """
     Formats parsed entries into standardized markdown.
     """
@@ -168,7 +153,9 @@ def generate_markdown(entries: List[Dict[str, Any]]) -> str:
         elif etype == "marker":
             md_lines.append(f"\n---\n### ⏸️ {entry['marker']}\n---\n")
         elif etype == "timestamp":
-            if not has_transcript_header and not any("Transcript" in line for line in md_lines):
+            if not has_transcript_header and not any(
+                "Transcript" in line for line in md_lines
+            ):
                 md_lines.append("# Transcript")
                 md_lines.append("")
                 has_transcript_header = True
@@ -184,43 +171,97 @@ def generate_markdown(entries: List[Dict[str, Any]]) -> str:
     return "\n".join(md_lines).strip() + "\n"
 
 
-def main():
-    parser = argparse.ArgumentParser(
-        description="Normalize a Wispr Flow .txt export into a searchable transcript.md"
-    )
-    parser.add_argument("input", help="Path to the Wispr Flow .txt export")
-    parser.add_argument("-o", "--output", help="Path to output transcript.md (defaults to stdout)")
-
-    args = parser.parse_args()
-
-    input_path = Path(args.input)
-    if not input_path.is_file():
-        print(f"Error: Input file '{args.input}' does not exist.", file=sys.stderr)
-        sys.exit(1)
-    if input_path.suffix.lower() != ".txt":
-        print(f"Error: Transcript must be a Wispr Flow .txt export: '{args.input}'.", file=sys.stderr)
-        sys.exit(1)
-
+def read_entries(path: Path) -> list[dict]:
+    if not path.is_file():
+        raise FileNotFoundError(f"Transcript file not found: {path}")
+    if path.suffix.lower() != ".txt":
+        raise ValueError(f"Transcript must be a timestamped .txt export: {path}")
     try:
-        content = input_path.read_text(encoding="utf-8")
+        content = path.read_text(encoding="utf-8")
     except UnicodeDecodeError:
-        content = input_path.read_text(encoding="latin-1")
+        content = path.read_text(encoding="latin-1")
+    entries = normalize_transcript(content)
+    if not any(
+        entry.get("type") == "timestamp" and entry.get("text", "").strip()
+        for entry in entries
+    ):
+        raise ValueError(f"Transcript contains no spoken text: {path}")
+    return entries
+
+
+def transcribe_videos(
+    video_paths: list[Path],
+    offsets: list[int],
+    work_dir: Path,
+    model: str = "small",
+    language: str = "pt",
+) -> list[dict]:
+    """Decode one recording at a time, preserving gaps before speech on its timeline."""
+    import subprocess
 
     try:
-        entries = normalize_transcript(content)
-        markdown_output = generate_markdown(entries)
-    except ValueError as exc:
-        print(f"Error: {exc}", file=sys.stderr)
-        sys.exit(1)
+        from faster_whisper import WhisperModel
+    except ImportError as exc:
+        raise RuntimeError(
+            "Local transcription requires `uv sync --extra audio`."
+        ) from exc
 
-    if args.output:
-        out_path = Path(args.output)
-        out_path.parent.mkdir(parents=True, exist_ok=True)
-        out_path.write_text(markdown_output, encoding="utf-8")
-        print(f"Normalized transcript saved to: {out_path} ({len(entries)} sections)")
-    else:
-        print(markdown_output)
-
-
-if __name__ == "__main__":
-    main()
+    recognizer = WhisperModel(model, device="cpu", compute_type="int8")
+    entries = []
+    audio_path = work_dir / "audio.wav"
+    for video, offset in zip(video_paths, offsets, strict=True):
+        print(f"Transcribing {video.name} with {model} ({language})...", flush=True)
+        # Keep the container origin: an audio track may start after the video.
+        result = subprocess.run(
+            [
+                "ffmpeg",
+                "-nostdin",
+                "-y",
+                "-copyts",
+                "-start_at_zero",
+                "-i",
+                str(video),
+                "-map",
+                "0:a:0",
+                "-vn",
+                "-af",
+                "aresample=async=1:first_pts=0",
+                "-ar",
+                "16000",
+                "-ac",
+                "1",
+                "-c:a",
+                "pcm_s16le",
+                str(audio_path),
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if result.returncode:
+            raise RuntimeError(
+                f"Could not extract audio from {video}: {result.stderr.strip()}"
+            )
+        segments, _ = recognizer.transcribe(
+            str(audio_path),
+            language=None if language == "auto" else language,
+            vad_filter=True,
+        )
+        count = 0
+        for segment in segments:
+            text = segment.text.strip()
+            if text:
+                entries.append(
+                    {
+                        "type": "timestamp",
+                        "sec": offset + int(segment.start),
+                        "text": text,
+                    }
+                )
+                count += 1
+        audio_path.unlink()
+        if not count:
+            raise ValueError(
+                f"No speech detected in {video}. Supply --transcript or check the audio."
+            )
+    return entries
