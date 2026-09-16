@@ -65,7 +65,6 @@ class TestModes(unittest.TestCase):
             ["--transcribe"],
             ["-t", self.text, "--no-frames"],
             ["-t", self.text, "--offsets", "0"],
-            ["-t", self.text, "--model", "tiny"],
             ["-t", self.text, "--language", "en"],
         ):
             with self.subTest(flags=flags), self.assertRaises(ValueError):
@@ -226,8 +225,6 @@ class TestVideoModes(unittest.TestCase):
                 "--transcribe",
                 "--offsets",
                 "10",
-                "--model",
-                "tiny",
                 "--language",
                 "en",
                 "--no-crop",
@@ -314,6 +311,41 @@ class TestVideoModes(unittest.TestCase):
         self.assertEqual(pdf.read_bytes(), b"existing material")
         self.assertEqual((self.output / "README.md").read_text(), "Slides only")
         self.assertFalse((self.output / "transcript.md").exists())
+
+
+class TestAudioModes(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix="digest_audio_")
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.audio = self.root / "recording.ogg"
+        self.output = self.root / "package"
+        subprocess.run(
+            [
+                "ffmpeg", "-nostdin", "-v", "error", "-y", "-f", "lavfi",
+                "-i", "sine=frequency=440:duration=3", str(self.audio),
+            ],
+            check=True,
+            capture_output=True,
+        )
+        self.model = Mock()
+        self.model.transcribe.return_value = (
+            iter([SimpleNamespace(start=0.4, text=" Recognized audio.")]), None
+        )
+        self.backend = SimpleNamespace(WhisperModel=Mock(return_value=self.model))
+
+    def compile(self, *values):
+        digest.compile_package(arguments(*values, "-o", self.output))
+
+    def test_audio_generates_a_transcript_only_package(self):
+        with installed_backend(self.backend):
+            self.compile("--audio", self.audio, "--transcribe", "--language", "en")
+        self.assertIn("Recognized audio.", (self.output / "transcript.md").read_text())
+        self.assertFalse((self.output / "frames").exists())
+
+    def test_audio_requires_transcribe(self):
+        with self.assertRaisesRegex(ValueError, "requires --transcribe"):
+            self.compile("--audio", self.audio)
 
 
 if __name__ == "__main__":

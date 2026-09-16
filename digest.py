@@ -19,13 +19,14 @@ def describe_crop(crop_boxes: dict) -> str:
     if not crop_boxes:
         return "Frames were not cropped."
     lines = []
-    for index, box in sorted(crop_boxes.items()):
-        if box is None:
-            description = "whole frame retained; cropping was disabled or detection was inconclusive."
+    for index, summary in sorted(crop_boxes.items()):
+        if summary.fixed_box is not None:
+            left, top, right, bottom = summary.fixed_box
+            description = f"cropped to `{left},{top},{right},{bottom}` in source pixels (manual override)."
         else:
-            left, top, right, bottom = box
             description = (
-                f"cropped to `{left},{top},{right},{bottom}` in source pixels."
+                f"{summary.cropped}/{summary.total} frames cropped to individually detected "
+                "Google Meet shared-screen bounds; all other frames retained whole."
             )
         lines.append(f"- Segment {index + 1}: {description}")
     return "\n".join(lines) + (
@@ -148,9 +149,9 @@ promotion rules — is in `AGENTS.md` at the repo root. Read it before digesting
     return readme_content.strip() + "\n"
 
 
-def probe_video(path: Path, needs_audio: bool) -> float:
+def probe_recording(path: Path, kind: str, requires_audio: bool = True) -> float:
     if not path.is_file():
-        raise FileNotFoundError(f"Video file not found: {path}")
+        raise FileNotFoundError(f"{kind.capitalize()} file not found: {path}")
     result = subprocess.run(
         [
             "ffprobe",
@@ -167,33 +168,33 @@ def probe_video(path: Path, needs_audio: bool) -> float:
         check=False,
     )
     if result.returncode:
-        raise ValueError(f"Could not read video {path}: {result.stderr.strip()}")
+        raise ValueError(f"Could not read {kind} {path}: {result.stderr.strip()}")
     info = json.loads(result.stdout)
     streams = info.get("streams", [])
-    if not any(
+    if kind == "video" and not any(
         s.get("codec_type") == "video"
         and not s.get("disposition", {}).get("attached_pic")
         for s in streams
     ):
         raise ValueError(f"No video stream in {path}.")
-    if needs_audio and not any(s.get("codec_type") == "audio" for s in streams):
+    if requires_audio and not any(s.get("codec_type") == "audio" for s in streams):
         raise ValueError(
-            f"No audio stream in {path}; supply --transcript for a silent recording."
+            f"No audio stream in {path}; supply --transcript for a silent video."
         )
     duration = float(info.get("format", {}).get("duration", 0))
     if not math.isfinite(duration) or duration <= 0:
-        raise ValueError(f"Video has no usable duration: {path}")
+        raise ValueError(f"{kind.capitalize()} has no usable duration: {path}")
     return duration
 
 
-def resolve_offsets(videos: list[Path], offsets: list[str] | None) -> list[int]:
-    if not videos:
+def resolve_offsets(recordings: list[Path], offsets: list[str] | None) -> list[int]:
+    if not recordings:
         if offsets is not None:
-            raise ValueError("--offsets requires video recordings.")
+            raise ValueError("--offsets requires video or audio recordings.")
         return []
     if offsets is None:
-        offsets = ["0"] if len(videos) == 1 else []
-    if len(offsets) != len(videos):
+        offsets = ["0"] if len(recordings) == 1 else []
+    if len(offsets) != len(recordings):
         raise ValueError(
             "Expected one --offsets value per recording; provide all starts in chronological order."
         )
@@ -217,18 +218,22 @@ def resolve_offsets(videos: list[Path], offsets: list[str] | None) -> list[int]:
 
 
 def validate_options(args: argparse.Namespace) -> tuple[list[int], list[dict]]:
-    if not (args.transcript or args.transcribe or args.slides):
+    if not (args.transcript or args.transcribe or args.audio or args.slides):
         raise ValueError(
             "Supply --transcript, --transcribe, or --slides. See --help for modes."
         )
-    if args.transcribe and not args.videos:
-        raise ValueError("--transcribe requires at least one video with audio.")
+    if args.transcribe and not (args.videos or args.audio):
+        raise ValueError("--transcribe requires at least one video or --audio recording.")
+    if args.audio and args.videos:
+        raise ValueError("Use either video arguments or --audio, not both.")
+    if args.audio and not args.transcribe:
+        raise ValueError("--audio requires --transcribe.")
     if args.videos and not (args.transcript or args.transcribe):
         raise ValueError("Video input requires --transcript or --transcribe.")
     if args.no_frames and not args.videos:
         raise ValueError("--no-frames requires a video.")
-    if not args.transcribe and (args.model is not None or args.language is not None):
-        raise ValueError("--model and --language require --transcribe.")
+    if not args.transcribe and args.language is not None:
+        raise ValueError("--language requires --transcribe.")
     for name in ("interval", "max_interval"):
         value = getattr(args, name)
         if not math.isfinite(value) or value <= 0:
@@ -255,7 +260,8 @@ def validate_options(args: argparse.Namespace) -> tuple[list[int], list[dict]]:
             raise FileNotFoundError(f"Slide material not found: {args.slides}")
         if args.slides.suffix.lower() not in slide_materials.SUPPORTED_SLIDE_SUFFIXES:
             raise ValueError("--slides accepts .pdf or .pptx.")
-    offsets = resolve_offsets(args.videos, args.offsets)
+    recordings = args.videos or args.audio
+    offsets = resolve_offsets(recordings, args.offsets)
     entries = transcript.read_entries(args.transcript) if args.transcript else []
     if args.videos:
         for executable in ("ffmpeg", "ffprobe"):
@@ -263,13 +269,25 @@ def validate_options(args: argparse.Namespace) -> tuple[list[int], list[dict]]:
                 raise RuntimeError(
                     f"{executable} is required; install FFmpeg (`brew install ffmpeg`)."
                 )
-        durations = [probe_video(video, args.transcribe) for video in args.videos]
+        durations = [
+            probe_recording(video, "video", requires_audio=args.transcribe)
+            for video in args.videos
+        ]
         if args.transcribe:
             for i in range(1, len(offsets)):
                 if offsets[i] < offsets[i - 1] + durations[i - 1]:
                     raise ValueError(
                         "Audio recordings overlap on the timeline. Correct --offsets or supply one --transcript."
                     )
+    elif args.audio:
+        if not shutil.which("ffmpeg") or not shutil.which("ffprobe"):
+            raise RuntimeError("FFmpeg is required; install FFmpeg (`brew install ffmpeg`).")
+        durations = [probe_recording(audio, "audio") for audio in args.audio]
+        for i in range(1, len(offsets)):
+            if offsets[i] < offsets[i - 1] + durations[i - 1]:
+                raise ValueError(
+                    "Audio recordings overlap on the timeline. Correct --offsets or supply one --transcript."
+                )
     return offsets, entries
 
 
@@ -308,12 +326,11 @@ def compile_package(args: argparse.Namespace) -> None:
         stage = Path(temporary) / "package"
         stage.mkdir()
         if args.transcribe:
-            model = args.model or "small"
             language = args.language or "pt"
             entries = transcript.transcribe_videos(
-                args.videos, offsets, Path(temporary), model, language
+                args.videos or args.audio, offsets, Path(temporary), language
             )
-            source = f"Local faster-whisper ASR (model `{model}`, language `{language}`); recognition may contain errors"
+            source = f"Local faster-whisper ASR (model `{transcript.MODEL}`, language `{language}`); recognition may contain errors"
         if args.slides:
             slide_materials.ingest_slides(args.slides, stage)
         slides_pdf = (stage if args.slides else output) / "materials" / "slides.pdf"
@@ -394,7 +411,7 @@ def compile_package(args: argparse.Namespace) -> None:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Digest: compile transcripts, videos and slides into agent-ready context.",
-        epilog="Modes: --transcript text.txt [with videos]; videos --transcribe; --slides deck.pdf alone or with either mode. Multiple videos require one --offsets value each.",
+        epilog="Modes: --transcript text.txt [with videos]; videos --transcribe; --audio recordings --transcribe; --slides deck.pdf alone or with either mode. Multiple recordings require one --offsets value each.",
     )
     parser.add_argument(
         "videos",
@@ -415,6 +432,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Generate a transcript locally from the first audio track of each video",
     )
     parser.add_argument(
+        "--audio",
+        nargs="+",
+        type=Path,
+        help="Audio recordings in chronological order; requires --transcribe and produces no frames",
+    )
+    parser.add_argument(
         "--slides",
         type=Path,
         help="Optional PDF/PPTX, also usable alone before the recording",
@@ -429,14 +452,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--offsets",
         nargs="+",
-        help="Start of each video on the transcript timeline; seconds/MM:SS/HH:MM:SS. Single video defaults to 0",
+        help="Start of each recording on the transcript timeline; seconds/MM:SS/HH:MM:SS. One recording defaults to 0",
     )
     parser.add_argument(
         "--title", default="", help="Package title (default: output directory name)"
-    )
-    parser.add_argument(
-        "--model",
-        help="faster-whisper model name or local model directory (default: small, CPU int8)",
     )
     parser.add_argument(
         "--language",
@@ -493,7 +512,7 @@ def build_parser() -> argparse.ArgumentParser:
     crop.add_argument(
         "--no-crop",
         action="store_true",
-        help="Keep whole frames; recommended for general videos",
+        help="Keep whole frames; disable automatic Google Meet cropping",
     )
     parser.add_argument(
         "--keep-raw",

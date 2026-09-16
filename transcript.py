@@ -4,6 +4,8 @@ import re
 from pathlib import Path
 from typing import Any
 
+MODEL = "small"
+
 
 def parse_timestamp_to_seconds(ts_str: str) -> int | None:
     """
@@ -193,7 +195,6 @@ def transcribe_videos(
     video_paths: list[Path],
     offsets: list[int],
     work_dir: Path,
-    model: str = "small",
     language: str = "pt",
 ) -> list[dict]:
     """Decode one recording at a time, preserving gaps before speech on its timeline."""
@@ -206,11 +207,11 @@ def transcribe_videos(
             "Local transcription requires `uv sync --extra audio`."
         ) from exc
 
-    recognizer = WhisperModel(model, device="cpu", compute_type="int8")
+    recognizer = WhisperModel(MODEL, device="cpu", compute_type="int8")
     entries = []
     audio_path = work_dir / "audio.wav"
     for video, offset in zip(video_paths, offsets, strict=True):
-        print(f"Transcribing {video.name} with {model} ({language})...", flush=True)
+        print(f"Transcribing {video.name} with {MODEL} ({language})...", flush=True)
         # Keep the container origin: an audio track may start after the video.
         result = subprocess.run(
             [

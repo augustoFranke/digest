@@ -1,10 +1,13 @@
 """Video frame extraction, shared-screen cropping and timeline deduplication."""
 
 import csv
+import io
+import math
 import re
 import shutil
 import subprocess
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 
 import imagehash
@@ -106,43 +109,15 @@ def extract_frames(
 
 Box = tuple[int, int, int, int]  # left, top, right, bottom, in full-resolution pixels
 
-ANALYSIS_DOWNSCALE = 8
-DEFAULT_SAMPLE = 24
 DEFAULT_MAX_EDGE = 1568
 DEFAULT_QUALITY = 82
 
-# A cell counts as content when it changes at least this share of what the
-# busiest cells change, never below the absolute floor. Measured on the real
-# lectures at these settings: the shared screen averages ~106 levels of
-# frame-to-frame change, the participant tiles ~29, the black letterbox ~22,
-# against a peak of ~147. A third of the peak is the gap between the first and
-# the rest; a lower cut lets the tiles in and the crop then swallows the call.
-ACTIVITY_THRESHOLD_FRACTION = 0.30
-ACTIVITY_FLOOR = 3.0
 
-# The kept region has to account for most of the change in the frame. If it does
-# not, the detector locked onto something that is moving beside the lecture —
-# the tile grid, most likely — and the whole frame is the safer answer.
-MIN_ACTIVITY_SHARE = 0.60
-
-# A detected box has to look like a shared screen, or we do not trust it.
-MIN_SIDE_FRACTION = 0.15
-MIN_AREA_FRACTION = 0.05
-MAX_AREA_FRACTION = 0.98
-
-# An edge is "quiet" below this share of the box's own median activity, and no
-# more than this share of a side may be trimmed away.
-TRIM_RATIO = 0.25
-MAX_TRIM_FRACTION = 0.25
-
-# Keeping more than this share of the frame is not wrong, but it is the
-# signature of a detection that separated nothing. Worth saying out loud.
-SUSPICIOUS_AREA_FRACTION = 0.70
-
-
-def _require_deps() -> None:
-    if np is None or Image is None:
-        raise ImportError("numpy and Pillow are required. Install with `uv sync`.")
+@dataclass(frozen=True)
+class CropSummary:
+    total: int
+    cropped: int
+    fixed_box: Box | None = None
 
 
 def group_frames_by_video(frame_files: list[Path]) -> dict[int, list[Path]]:
@@ -168,280 +143,123 @@ def group_frames_by_video(frame_files: list[Path]) -> dict[int, list[Path]]:
     return groups
 
 
-def _change_map(frame_files: list[Path], sample: int, downscale: int):
-    """
-    Per-pixel mean absolute difference between consecutive sampled frames,
-    computed at 1/downscale scale. Returns (change_map, full_width, full_height).
+def _runs(mask):
+    edges = np.diff(np.r_[False, mask, False].astype(np.int8))
+    return zip(np.flatnonzero(edges == 1), np.flatnonzero(edges == -1))
 
-    Consecutive differences rather than a standard deviation over the whole
-    sample: both are large for the shared screen, but only the deviation is
-    large for something that sits in two states over an hour — a control bar
-    that hides itself, a webcam tile whose owner walked away. Differencing
-    first charges each cell for how often it changes, not for how far apart its
-    extremes are, and that is what tells the lecture from the call around it.
-    """
-    picks = sorted(
-        set(
-            np.linspace(0, len(frame_files) - 1, min(sample, len(frame_files)))
-            .astype(int)
-            .tolist()
+
+def _presentation_rectangle(image: Image.Image) -> Box | None:
+    """Find a dominant landscape tile bounded by the dark Meet gutters."""
+    small = image.convert("RGB")
+    small.thumbnail((800, 800))
+    pixels = np.asarray(small).astype(np.int16)
+    height, width = pixels.shape[:2]
+    if width < 200 or height < 150:
+        return None
+    # Exclude browser/presentation headers and call controls. A tile touching
+    # these limits is ambiguous, so it will be retained as a full frame.
+    top, bottom = round(height * 0.18), round(height * 0.88)
+    region = pixels[top:bottom]
+    neutral = (region.max(axis=2) <= 64) & (np.ptp(region, axis=2) <= 8)
+    if neutral.mean() < 0.10:
+        return None
+    levels = region[neutral].mean(axis=1).astype(int)
+    background = int(np.bincount(levels, minlength=256).argmax())
+    foreground = np.max(np.abs(region - background), axis=2) > 12
+    # Webcam focus glows can paint part of a gutter; require a majority of
+    # the column to belong to a tile instead of treating any color as content.
+    columns = foreground.mean(axis=0) > 0.55
+    # Ignore single-pixel seams within a shared screen, but preserve gutters.
+    for left, right in list(_runs(~columns)):
+        if left > 0 and right < width and right - left < 3:
+            columns[left:right] = True
+    candidates = []
+    for left, right in _runs(columns):
+        if right - left < width * 0.40 or left < 2 or right > width - 2:
+            continue
+        rows = foreground[:, left + 2 : right - 2].mean(axis=1) > 0.10
+        for upper, lower in _runs(rows):
+            tile_width, tile_height = right - left, lower - upper
+            if upper < 2 or lower > bottom - top - 2:
+                continue
+            if not 1.3 <= tile_width / tile_height <= 2.5:
+                continue
+            if tile_width * tile_height < width * height * 0.20:
+                continue
+            tile = foreground[upper:lower, left:right]
+            if tile.mean() < 0.65:
+                continue
+            # Solid outer edges distinguish a complete tile from a moving
+            # patch or a disconnected group of participant tiles.
+            edges = (tile[2, :], tile[-3, :], tile[:, 2], tile[:, -3])
+            if any(edge.mean() < 0.70 for edge in edges):
+                continue
+            candidates.append((left, upper + top, right, lower + top))
+    if len(candidates) != 1:
+        return None
+    left, top, right, bottom = candidates[0]
+    scale_x, scale_y = image.width / width, image.height / height
+    # Round outwards with one analysis pixel of padding to preserve edge text.
+    return (
+        max(0, math.floor((left - 1) * scale_x)),
+        max(0, math.floor((top - 1) * scale_y)),
+        min(image.width, math.ceil((right + 1) * scale_x)),
+        min(image.height, math.ceil((bottom + 1) * scale_y)),
+    )
+
+
+def _meet_presenting_header(image: Image.Image, tesseract: str) -> bool:
+    header = image.crop((0, 0, image.width, round(image.height * 0.18)))
+    header.thumbnail((2200, 2200))
+    data = io.BytesIO()
+    header.save(data, format="PNG")
+    result = subprocess.run(
+        [tesseract, "stdin", "stdout", "--psm", "11", "tsv"],
+        input=data.getvalue(),
+        capture_output=True,
+        timeout=15,
+        check=False,
+    )
+    if result.returncode:
+        raise RuntimeError(
+            f"Tesseract failed: {result.stderr.decode(errors='replace').strip()}"
         )
-    )
-
-    stack = []
-    full_size = None
-    for i in picks:
-        with Image.open(frame_files[i]) as img:
-            gray = img.convert("L")
-            full_size = gray.size
-            small = gray.resize(
-                (max(1, gray.width // downscale), max(1, gray.height // downscale)),
-                Image.BILINEAR,
-            )
-            stack.append(np.asarray(small, dtype=np.float32))
-
-    shapes = {a.shape for a in stack}
-    if len(shapes) != 1:
-        raise ValueError(f"Frames in this group have inconsistent sizes: {shapes}")
-
+    address_bottom = None
+    presenter_top = None
+    for word in csv.DictReader(io.StringIO(result.stdout.decode()), delimiter="\t"):
+        if float(word["conf"]) < 60:
+            continue
+        text = word["text"].lower()
+        x, y = int(word["left"]), int(word["top"])
+        if (
+            re.search(r"^(?:https?://)?meet\.google\.com/[a-z]", text)
+            and y < header.height * 0.5
+        ):
+            address_bottom = y + int(word["height"])
+        if re.search(r"\b(presenting|apresentando)\b", text) and x > header.width * 0.5:
+            presenter_top = y
     return (
-        np.abs(np.diff(np.stack(stack), axis=0)).mean(axis=0),
-        full_size[0],
-        full_size[1],
+        address_bottom is not None
+        and presenter_top is not None
+        and presenter_top > address_bottom
     )
 
 
-def _erode(mask):
-    """3x3 erosion. Removes structures thinner than the kernel — the call's text rows."""
-    out = mask.copy()
-    out[1:, :] &= mask[:-1, :]
-    out[:-1, :] &= mask[1:, :]
-    out[:, 1:] &= mask[:, :-1]
-    out[:, :-1] &= mask[:, 1:]
-    return out
-
-
-def _box_blur(arr, radius: int):
-    """Mean over a (2*radius+1) square, via a summed-area table."""
-    pad = np.pad(arr, radius + 1, mode="edge")
-    integral = pad.cumsum(axis=0).cumsum(axis=1)
-    size = 2 * radius + 1
-    h, w = arr.shape
-    total = (
-        integral[size : size + h, size : size + w]
-        - integral[0:h, size : size + w]
-        - integral[size : size + h, 0:w]
-        + integral[0:h, 0:w]
-    )
-    return total / (size * size)
-
-
-def _trim_quiet_edges(
-    change, box_cells, ratio: float = TRIM_RATIO, max_trim: float = MAX_TRIM_FRACTION
-):
-    """
-    Shaves rows and columns off the edges of `box_cells` while they are far
-    quieter than the box's own interior.
-
-    The blob search returns a bounding box, and a bounding box is greedy: one
-    live webcam tile touching the shared screen, or a window that moved during
-    the lecture, drags a whole edge outwards. Those edges are quiet compared to
-    the lecture content, so they can be shaved off. The trim is bounded so a
-    genuinely calm lecture cannot be whittled away.
-    """
-    left, top, right, bottom = box_cells
-    reference = float(np.median(change[top : bottom + 1, left : right + 1]))
-    if reference <= 0:
-        return box_cells
-
-    floor = ratio * reference
-    min_width = max(1, round((right - left + 1) * (1 - max_trim)))
-    min_height = max(1, round((bottom - top + 1) * (1 - max_trim)))
-
-    trimming = True
-    while trimming:
-        trimming = False
-        if bottom - top + 1 > min_height:
-            if change[top, left : right + 1].mean() < floor:
-                top += 1
-                trimming = True
-            elif change[bottom, left : right + 1].mean() < floor:
-                bottom -= 1
-                trimming = True
-        if right - left + 1 > min_width:
-            if change[top : bottom + 1, left].mean() < floor:
-                left += 1
-                trimming = True
-            elif change[top : bottom + 1, right].mean() < floor:
-                right -= 1
-                trimming = True
-
-    return left, top, right, bottom
-
-
-def _component_containing(mask, seed: tuple[int, int]):
-    """Flood fill of `mask` from `seed`, by repeated 4-neighbour dilation."""
-    current = np.zeros_like(mask)
-    current[seed] = True
-    while True:
-        grown = current.copy()
-        grown[1:, :] |= current[:-1, :]
-        grown[:-1, :] |= current[1:, :]
-        grown[:, 1:] |= current[:, :-1]
-        grown[:, :-1] |= current[:, 1:]
-        grown &= mask
-        if grown.sum() == current.sum():
-            return current
-        current = grown
-
-
-def _activity_mask(change, verbose: bool):
-    """Returns cells whose repeated change is strong enough to be lecture content."""
-    peak = float(np.percentile(change, 99.5))
-    if peak < 2.0:
-        if verbose:
-            print("  Frames barely change over time; keeping the full frame.")
-        return None
-
-    mask = _erode(change > max(ACTIVITY_FLOOR, ACTIVITY_THRESHOLD_FRACTION * peak))
-    if not mask.any() and verbose:
-        print("  No region survived the activity threshold; keeping the full frame.")
-    return mask if mask.any() else None
-
-
-def _content_cells(change, mask) -> Box:
-    """Finds and trims the connected active region around the densest area."""
-    weighted_change = np.where(mask, change, 0.0)
-    seed = np.unravel_index(
-        int(np.argmax(_box_blur(weighted_change, radius=3))), change.shape
-    )
-    if not mask[seed]:
-        seed = np.unravel_index(int(np.argmax(weighted_change)), change.shape)
-
-    component = _component_containing(mask, seed)
-    rows = np.where(component.any(axis=1))[0]
-    cols = np.where(component.any(axis=0))[0]
-    cells = (
-        max(0, int(cols.min()) - 1),
-        max(0, int(rows.min()) - 1),
-        min(change.shape[1] - 1, int(cols.max()) + 1),
-        min(change.shape[0] - 1, int(rows.max()) + 1),
-    )
-    return _trim_quiet_edges(change, cells)
-
-
-def _cell_box_to_frame_box(
-    cells: Box, downscale: int, full_width: int, full_height: int
-) -> Box:
-    """Scales inclusive analysis cells back to image coordinates."""
-    left, top, right, bottom = cells
-    return (
-        left * downscale,
-        top * downscale,
-        min(full_width, (right + 1) * downscale),
-        min(full_height, (bottom + 1) * downscale),
-    )
-
-
-def _report_detected_box(
-    box: Box, full_width: int, full_height: int, verbose: bool
-) -> None:
-    """Explains a successful detection and flags a potentially broad crop."""
-    if not verbose:
-        return
-    left, top, right, bottom = box
-    kept = ((right - left) * (bottom - top)) / float(full_width * full_height)
-    print(
-        f"  Detected content box {left},{top} -> {right},{bottom} "
-        f"({right - left}x{bottom - top}, {kept:.0%} of the frame)"
-    )
-    if kept <= SUSPICIOUS_AREA_FRACTION:
-        return
-    print(
-        "  That is most of the frame. Two things cause it, and they need opposite responses:"
-    )
-    print(
-        "    - The window moved during the recording, or the call's layout changed (tiles "
-        "from the side to the top, a chat panel opening). The box is then the union of every "
-        "position the lecture occupied, and it is correct — no single crop does better."
-    )
-    print(
-        "    - The sample covers too short a stretch. Over a few minutes the shared screen "
-        "sits still while the webcams move, so the detection separates nothing."
-    )
-    print(
-        "  Look at a frame from early and one from late before overriding with --crop-box."
-    )
-
-
-def detect_content_box(
-    frame_files: list[Path],
-    sample: int = DEFAULT_SAMPLE,
-    downscale: int = ANALYSIS_DOWNSCALE,
-    verbose: bool = True,
-) -> Box | None:
-    """
-    Finds the region of the frame that carries the lecture, or None when the
-    frames give no trustworthy answer.
-
-    Everything the call itself draws — window chrome, participant tiles, the
-    control bar, letterbox — either sits still, blinks a handful of times, or
-    moves gently. The shared screen is the one large area that rewrites itself
-    over and over, so: threshold the frame-to-frame change, erode away the thin
-    strips, and take the bounding box of the blob containing the densest
-    activity.
-    """
-    _require_deps()
-
-    if len(frame_files) < 4:
-        if verbose:
+def detect_meet_content_box(frame: Path, tesseract: str) -> Box | None:
+    """Crop only a recognized Meet presentation; uncertainty keeps the frame."""
+    with Image.open(frame) as image:
+        box = _presentation_rectangle(image)
+        if box is None:
+            return None
+        try:
+            presenting = _meet_presenting_header(image, tesseract)
+        except (OSError, subprocess.TimeoutExpired, RuntimeError) as error:
             print(
-                f"  Only {len(frame_files)} frame(s) — too few to detect a crop; keeping the full frame."
+                f"  {frame.name}: Meet detection unavailable ({error}); keeping full frame.",
+                file=sys.stderr,
             )
-        return None
-
-    change, full_w, full_h = _change_map(frame_files, sample, downscale)
-    mask = _activity_mask(change, verbose)
-    if mask is None:
-        return None
-
-    cells = _content_cells(change, mask)
-    left_c, top_c, right_c, bottom_c = cells
-    share = float(
-        change[top_c : bottom_c + 1, left_c : right_c + 1].sum() / change.sum()
-    )
-    if share < MIN_ACTIVITY_SHARE:
-        if verbose:
-            print(
-                f"  The detected region holds only {share:.0%} of the change in the frame, so the "
-                "lecture is probably not what was detected; keeping the full frame."
-            )
-        return None
-
-    box = _cell_box_to_frame_box(cells, downscale, full_w, full_h)
-    if not _box_is_plausible(box, full_w, full_h, verbose=verbose):
-        return None
-    _report_detected_box(box, full_w, full_h, verbose)
-    return box
-
-
-def _box_is_plausible(box: Box, full_w: int, full_h: int, verbose: bool = True) -> bool:
-    left, top, right, bottom = box
-    width, height = right - left, bottom - top
-    if width < MIN_SIDE_FRACTION * full_w or height < MIN_SIDE_FRACTION * full_h:
-        if verbose:
-            print(
-                f"  Detected box {width}x{height} is too small to be the shared screen; keeping the full frame."
-            )
-        return False
-    area = (width * height) / float(full_w * full_h)
-    if area < MIN_AREA_FRACTION or area > MAX_AREA_FRACTION:
-        if verbose:
-            print(
-                f"  Detected box covers {area:.0%} of the frame, which is implausible; keeping the full frame."
-            )
-        return False
-    return True
+            return None
+        return box if presenting else None
 
 
 def parse_box_string(text: str) -> Box:
@@ -488,19 +306,16 @@ def crop_frames(
     output_dir: Path,
     max_edge: int = DEFAULT_MAX_EDGE,
     quality: int = DEFAULT_QUALITY,
-    sample: int = DEFAULT_SAMPLE,
     box: Box | None = None,
     detect: bool = True,
-) -> dict[int, Box | None]:
+) -> dict[int, CropSummary]:
     """
     Crops and shrinks every raw frame in `raw_dir` into `output_dir`, keeping the
     filenames so the later steps can still read the sequence numbers.
 
-    A crop is detected per video group. `box` overrides detection for every group.
-    Returns the box applied to each group, None meaning the full frame was kept.
+    Meet presentation bounds are checked independently in every frame.
+    An explicit `box` overrides detection. Returns counts per video group.
     """
-    _require_deps()
-
     if not raw_dir.is_dir():
         raise FileNotFoundError(f"Raw frames directory '{raw_dir}' does not exist.")
 
@@ -513,7 +328,12 @@ def crop_frames(
     groups = group_frames_by_video(frame_files)
 
     bytes_before = sum(f.stat().st_size for f in frame_files)
-    applied: dict[int, Box | None] = {}
+    applied: dict[int, CropSummary] = {}
+    tesseract = shutil.which("tesseract") if detect and box is None else None
+    if detect and box is None and tesseract is None:
+        print(
+            "  Tesseract is unavailable; keeping full frames. Install with `brew install tesseract` for automatic Meet cropping."
+        )
 
     for vid_idx in sorted(groups):
         files = groups[vid_idx]
@@ -521,16 +341,16 @@ def crop_frames(
         print(f"\n{label} Cropping {len(files)} frame(s)...")
 
         if box is not None:
-            group_box = box
-            print(f"  Using the box given on the command line: {group_box}")
-        elif detect:
-            group_box = detect_content_box(files, sample=sample)
-        else:
-            group_box = None
-
-        applied[vid_idx] = group_box
+            print(f"  Using the box given on the command line: {box}")
+        cropped = 0
         for f in files:
-            crop_and_resize(f, output_dir / f.name, group_box, max_edge, quality)
+            frame_box = box
+            if box is None and tesseract is not None:
+                frame_box = detect_meet_content_box(f, tesseract)
+            cropped += frame_box is not None
+            crop_and_resize(f, output_dir / f.name, frame_box, max_edge, quality)
+        applied[vid_idx] = CropSummary(len(files), cropped, box)
+        print(f"  Cropped {cropped}/{len(files)} frames; kept the rest whole.")
 
     written = sorted(output_dir.glob("*.jpg"))
     bytes_after = sum(f.stat().st_size for f in written)
